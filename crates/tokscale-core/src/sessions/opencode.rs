@@ -6,8 +6,8 @@
 
 use super::utils::{open_readonly_sqlite, read_file_or_none};
 use super::{
-    normalize_opencode_agent_name, normalize_workspace_key, workspace_label_from_key,
-    UnifiedMessage,
+    content_preview_from_value, normalize_opencode_agent_name, normalize_workspace_key,
+    workspace_label_from_key, UnifiedMessage,
 };
 use crate::TokenBreakdown;
 #[cfg(test)]
@@ -31,6 +31,7 @@ pub struct OpenCodeMessage {
     pub provider_id: Option<String>,
     pub cost: Option<f64>,
     pub tokens: Option<OpenCodeTokens>,
+    pub content: Option<serde_json::Value>,
     pub time: OpenCodeTime,
     pub agent: Option<String>,
     pub mode: Option<String>,
@@ -154,6 +155,7 @@ pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
         .and_then(|path| path.root.as_deref())
         .map(str::to_string);
     let tokens = msg.tokens?;
+    let content_preview = msg.content.as_ref().and_then(content_preview_from_value);
     let model_id = msg.model_id?;
     let agent_or_mode = msg.mode.or(msg.agent);
     let agent = agent_or_mode.map(|a| normalize_opencode_agent_name(&a));
@@ -185,6 +187,7 @@ pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
     );
     unified.duration_ms = opencode_duration_ms(&msg.time);
     unified.dedup_key = dedup_key;
+    unified.set_content_preview(content_preview);
     set_workspace_from_root(&mut unified, workspace_root.as_deref());
     Some(unified)
 }
@@ -261,6 +264,7 @@ pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             Some(t) => t,
             None => continue,
         };
+        let content_preview = msg.content.as_ref().and_then(content_preview_from_value);
 
         let model_id = match msg.model_id {
             Some(m) => m,
@@ -309,6 +313,7 @@ pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         );
         unified.duration_ms = opencode_duration_ms(&msg.time);
         unified.dedup_key = Some(dedup_key);
+        unified.set_content_preview(content_preview);
         let workspace_root = row_workspace_root
             .as_deref()
             .or(embedded_workspace_root.as_deref());

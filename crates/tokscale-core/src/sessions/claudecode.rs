@@ -7,7 +7,8 @@ use super::utils::{
     read_file_or_none,
 };
 use super::{
-    normalize_agent_name, normalize_workspace_key, workspace_label_from_key, UnifiedMessage,
+    content_preview_from_value, normalize_agent_name, normalize_workspace_key,
+    workspace_label_from_key, UnifiedMessage,
 };
 use crate::{pricing, provider_identity, TokenBreakdown};
 use serde::Deserialize;
@@ -66,6 +67,7 @@ impl CcMirrorVariantMetadata {
 pub struct ClaudeMessage {
     pub model: Option<String>,
     pub usage: Option<ClaudeUsage>,
+    pub content: Option<Value>,
     /// Message ID for deduplication (used with requestId)
     pub id: Option<String>,
     /// Optional billing or routing provider emitted by wrappers around Claude Code.
@@ -379,6 +381,7 @@ pub fn parse_claude_file_with_cache_and_home(
     // Tracks whether the previous entry was a user message,
     // so the next assistant message can be marked as a turn start.
     let mut pending_turn_start = false;
+    let mut pending_content_preview: Option<String> = None;
     let mut pending_request_start_timestamp_ms: Option<i64> = None;
     let mut last_model: Option<String> = None;
     let mut last_provider_hint: Option<String> = None;
@@ -443,6 +446,11 @@ pub fn parse_claude_file_with_cache_and_home(
 
                 if entry.entry_type == "user" && is_human_turn(trimmed) {
                     pending_turn_start = true;
+                    pending_content_preview = entry
+                        .message
+                        .as_ref()
+                        .and_then(|message| message.content.as_ref())
+                        .and_then(content_preview_from_value);
                 }
 
                 if let Some(tool_message) = tool_result_message {
@@ -591,6 +599,7 @@ pub fn parse_claude_file_with_cache_and_home(
                     unified.is_turn_start = true;
                     pending_turn_start = false;
                 }
+                unified.set_content_preview(pending_content_preview.take());
                 messages.push(unified);
                 provider_confidences.push(provider_confidence);
                 // Consume the pending request-start timestamp so a back-to-back
@@ -1197,7 +1206,7 @@ fn extract_claude_headless_message(
     let model = canonicalize_claude_model(&raw_model);
     let timestamp = extract_claude_timestamp(value).unwrap_or(fallback_timestamp);
 
-    Some(UnifiedMessage::new(
+    let mut message = UnifiedMessage::new(
         client_id,
         model,
         provider_id,
@@ -1215,7 +1224,15 @@ fn extract_claude_headless_message(
             reasoning: 0,
         },
         0.0,
-    ))
+    );
+    message.set_content_preview(
+        value
+            .get("message")
+            .and_then(|msg| msg.get("content"))
+            .or_else(|| value.get("content"))
+            .and_then(content_preview_from_value),
+    );
+    Some(message)
 }
 
 /// Internal Claude Code system/tool tags that should NOT be counted as human turns.

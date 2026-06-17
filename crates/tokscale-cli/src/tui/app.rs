@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -148,12 +148,51 @@ pub struct ClickArea {
 #[derive(Debug, Clone, Copy)]
 pub struct DailyDetailRow<'a> {
     pub source: &'a str,
+    pub model_key: &'a str,
     pub provider: &'a str,
     pub model: &'a str,
     pub color_key: &'a str,
     pub tokens: &'a TokenBreakdown,
     pub cost: f64,
     pub messages: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DailyModelDetailSelection {
+    date: NaiveDate,
+    source: String,
+    model_key: String,
+    model: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DailySessionRow {
+    pub date: NaiveDate,
+    pub source: String,
+    pub provider: String,
+    pub model_key: String,
+    pub model: String,
+    pub color_key: String,
+    pub session_id: String,
+    pub dirs: Vec<String>,
+    pub agents: Vec<String>,
+    pub preview: Option<String>,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub requests: u64,
+    pub preview_requests: u64,
+    pub message_count: u64,
+    pub first_timestamp: i64,
+    pub last_timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DailySessionDetailSelection {
+    date: NaiveDate,
+    source: String,
+    model_key: String,
+    model: String,
+    session_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -218,8 +257,14 @@ pub struct App {
     pub selected_index: usize,
     pub max_visible_items: usize,
     pub selected_daily_detail_date: Option<NaiveDate>,
+    selected_daily_model_detail: Option<DailyModelDetailSelection>,
+    selected_daily_session_detail: Option<DailySessionDetailSelection>,
     daily_list_selected_index: usize,
     daily_list_scroll_offset: usize,
+    daily_detail_selected_index: usize,
+    daily_detail_scroll_offset: usize,
+    daily_model_selected_index: usize,
+    daily_model_scroll_offset: usize,
 
     pub selected_graph_cell: Option<(usize, usize)>,
     pub stats_breakdown_total_lines: usize,
@@ -347,8 +392,14 @@ impl App {
             selected_index: 0,
             max_visible_items: 20,
             selected_daily_detail_date: None,
+            selected_daily_model_detail: None,
+            selected_daily_session_detail: None,
             daily_list_selected_index: 0,
             daily_list_scroll_offset: 0,
+            daily_detail_selected_index: 0,
+            daily_detail_scroll_offset: 0,
+            daily_model_selected_index: 0,
+            daily_model_scroll_offset: 0,
             selected_graph_cell: None,
             stats_breakdown_total_lines: 0,
             auto_refresh,
@@ -414,10 +465,31 @@ impl App {
         // empty while the user is still nominally in detail mode.
         if let Some(date) = self.selected_daily_detail_date {
             if !self.data.daily.iter().any(|day| day.date == date) {
+                self.selected_daily_session_detail = None;
+                self.selected_daily_model_detail = None;
                 self.selected_daily_detail_date = None;
                 self.selected_index = self.daily_list_selected_index;
                 self.scroll_offset = self.daily_list_scroll_offset;
             }
+        }
+        if self
+            .selected_daily_model_detail
+            .as_ref()
+            .is_some_and(|selection| !self.daily_detail_row_exists(selection))
+        {
+            self.selected_daily_session_detail = None;
+            self.selected_daily_model_detail = None;
+            self.selected_index = self.daily_detail_selected_index;
+            self.scroll_offset = self.daily_detail_scroll_offset;
+        }
+        if self
+            .selected_daily_session_detail
+            .as_ref()
+            .is_some_and(|selection| !self.daily_session_row_exists(selection))
+        {
+            self.selected_daily_session_detail = None;
+            self.selected_index = self.daily_model_selected_index;
+            self.scroll_offset = self.daily_model_scroll_offset;
         }
 
         self.clamp_selection();
@@ -694,10 +766,20 @@ impl App {
                 self.refresh_usage();
             }
             KeyCode::Enter if self.current_tab == Tab::Daily => {
-                self.open_selected_daily_detail();
+                self.handle_daily_enter();
             }
             KeyCode::Enter if self.current_tab == Tab::Stats => {
                 self.handle_graph_selection();
+            }
+            KeyCode::Esc | KeyCode::Backspace
+                if self.current_tab == Tab::Daily && self.is_daily_session_detail_active() =>
+            {
+                self.close_daily_session_detail();
+            }
+            KeyCode::Esc | KeyCode::Backspace
+                if self.current_tab == Tab::Daily && self.is_daily_model_detail_active() =>
+            {
+                self.close_daily_model_detail();
             }
             KeyCode::Esc | KeyCode::Backspace
                 if self.current_tab == Tab::Daily && self.is_daily_detail_active() =>
@@ -1069,8 +1151,14 @@ impl App {
         self.scroll_offset = 0;
         self.selected_index = 0;
         self.selected_daily_detail_date = None;
+        self.selected_daily_session_detail = None;
+        self.selected_daily_model_detail = None;
         self.daily_list_selected_index = 0;
         self.daily_list_scroll_offset = 0;
+        self.daily_detail_selected_index = 0;
+        self.daily_detail_scroll_offset = 0;
+        self.daily_model_selected_index = 0;
+        self.daily_model_scroll_offset = 0;
         self.selected_graph_cell = None;
         self.stats_breakdown_total_lines = 0;
     }
@@ -1084,6 +1172,8 @@ impl App {
         }
         if target != Tab::Daily {
             self.selected_daily_detail_date = None;
+            self.selected_daily_session_detail = None;
+            self.selected_daily_model_detail = None;
         }
 
         let (field, dir) = self
@@ -1096,7 +1186,7 @@ impl App {
     }
 
     fn default_sort_for_tab(tab: Tab) -> (SortField, SortDirection) {
-        if matches!(tab, Tab::Hourly | Tab::Minutely) {
+        if matches!(tab, Tab::Daily | Tab::Hourly | Tab::Minutely) {
             (SortField::Date, SortDirection::Descending)
         } else {
             (SortField::Cost, SortDirection::Descending)
@@ -1246,6 +1336,12 @@ impl App {
         match self.current_tab {
             Tab::Overview | Tab::Models => self.data.models.len(),
             Tab::Agents => self.data.agents.len(),
+            Tab::Daily if self.is_daily_session_detail_active() => {
+                self.get_sorted_daily_message_rows().len()
+            }
+            Tab::Daily if self.is_daily_model_detail_active() => {
+                self.get_sorted_daily_session_rows().len()
+            }
             Tab::Daily if self.is_daily_detail_active() => {
                 self.get_sorted_daily_detail_rows().len()
             }
@@ -1294,6 +1390,8 @@ impl App {
         if self.current_tab != Tab::Daily {
             return;
         }
+        self.selected_daily_session_detail = None;
+        self.selected_daily_model_detail = None;
         self.selected_daily_detail_date = None;
 
         let today = chrono::Local::now().date_naive();
@@ -1382,11 +1480,20 @@ impl App {
         self.dialog_stack.show(Box::new(dialog));
     }
 
-    fn open_selected_daily_detail(&mut self) {
-        if self.is_daily_detail_active() {
+    fn handle_daily_enter(&mut self) {
+        if self.is_daily_session_detail_active() {
             return;
         }
+        if self.is_daily_model_detail_active() {
+            self.open_selected_daily_session_detail();
+        } else if self.is_daily_detail_active() {
+            self.open_selected_daily_model_detail();
+        } else {
+            self.open_selected_daily_detail();
+        }
+    }
 
+    fn open_selected_daily_detail(&mut self) {
         let selected_date = {
             let daily = self.get_sorted_daily();
             daily.get(self.selected_index).map(|day| day.date)
@@ -1396,6 +1503,8 @@ impl App {
             self.daily_list_selected_index = self.selected_index;
             self.daily_list_scroll_offset = self.scroll_offset;
             self.selected_daily_detail_date = Some(date);
+            self.selected_daily_session_detail = None;
+            self.selected_daily_model_detail = None;
             self.selected_index = 0;
             self.scroll_offset = 0;
             self.set_status(&format!("Viewing daily details for {}", date));
@@ -1403,11 +1512,117 @@ impl App {
         }
     }
 
+    fn open_selected_daily_model_detail(&mut self) {
+        let Some(date) = self.selected_daily_detail_date else {
+            return;
+        };
+        let selected = {
+            let rows = self.get_sorted_daily_detail_rows();
+            rows.get(self.selected_index).map(|row| DailyModelDetailSelection {
+                date,
+                source: row.source.to_string(),
+                model_key: row.model_key.to_string(),
+                model: row.model.to_string(),
+            })
+        };
+
+        if let Some(selection) = selected {
+            self.daily_detail_selected_index = self.selected_index;
+            self.daily_detail_scroll_offset = self.scroll_offset;
+            self.selected_daily_session_detail = None;
+            self.selected_daily_model_detail = Some(selection.clone());
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            self.set_status(&format!("Viewing sessions for {}", selection.model));
+            self.clamp_selection();
+        }
+    }
+
+    fn open_selected_daily_session_detail(&mut self) {
+        let selected = {
+            let rows = self.get_sorted_daily_session_rows();
+            rows.get(self.selected_index)
+                .map(|row| DailySessionDetailSelection {
+                    date: row.date,
+                    source: row.source.clone(),
+                    model_key: row.model_key.clone(),
+                    model: row.model.clone(),
+                    session_id: row.session_id.clone(),
+                })
+        };
+
+        if let Some(selection) = selected {
+            self.daily_model_selected_index = self.selected_index;
+            self.daily_model_scroll_offset = self.scroll_offset;
+            self.selected_daily_session_detail = Some(selection.clone());
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            self.set_status(&format!("Viewing requests for {}", selection.session_id));
+            self.clamp_selection();
+        }
+    }
+
+    fn close_daily_session_detail(&mut self) {
+        let Some(selection) = self.selected_daily_session_detail.take() else {
+            return;
+        };
+
+        let restored_index = self
+            .get_sorted_daily_session_rows()
+            .iter()
+            .position(|row| row.session_id == selection.session_id)
+            .unwrap_or(self.daily_model_selected_index);
+
+        self.selected_index = restored_index;
+
+        let max_visible = self.max_visible_items.max(1);
+        let viewport_still_holds = restored_index >= self.daily_model_scroll_offset
+            && restored_index < self.daily_model_scroll_offset + max_visible;
+        self.scroll_offset = if viewport_still_holds {
+            self.daily_model_scroll_offset
+        } else {
+            restored_index.saturating_sub(max_visible / 2)
+        };
+
+        self.set_status("Returned to daily session details");
+        self.clamp_selection();
+    }
+
+    fn close_daily_model_detail(&mut self) {
+        let Some(selection) = self.selected_daily_model_detail.take() else {
+            return;
+        };
+
+        self.selected_daily_session_detail = None;
+
+        let restored_index = self
+            .get_sorted_daily_detail_rows()
+            .iter()
+            .position(|row| row.source == selection.source && row.model_key == selection.model_key)
+            .unwrap_or(self.daily_detail_selected_index);
+
+        self.selected_index = restored_index;
+
+        let max_visible = self.max_visible_items.max(1);
+        let viewport_still_holds = restored_index >= self.daily_detail_scroll_offset
+            && restored_index < self.daily_detail_scroll_offset + max_visible;
+        self.scroll_offset = if viewport_still_holds {
+            self.daily_detail_scroll_offset
+        } else {
+            restored_index.saturating_sub(max_visible / 2)
+        };
+
+        self.set_status("Returned to daily model details");
+        self.clamp_selection();
+    }
+
     fn close_daily_detail(&mut self) {
         let Some(detail_date) = self.selected_daily_detail_date else {
             return;
         };
 
+        self.selected_daily_session_detail = None;
+        self.selected_daily_model_detail = None;
         self.selected_daily_detail_date = None;
 
         // Re-anchor by date so a sort change inside detail mode still
@@ -1490,6 +1705,33 @@ impl App {
                 .get_sorted_agents()
                 .get(self.selected_index)
                 .map(|a| format!("{}: {} tokens, ${:.4}", a.agent, a.tokens.total(), a.cost)),
+            Tab::Daily if self.is_daily_session_detail_active() => self
+                .get_sorted_daily_message_rows()
+                .get(self.selected_index)
+                .map(|row| {
+                    format!(
+                        "{} / {} / {}: {} tokens, ${:.4}",
+                        row.source,
+                        row.model,
+                        row.session_id,
+                        row.tokens.total(),
+                        row.cost
+                    )
+                }),
+            Tab::Daily if self.is_daily_model_detail_active() => self
+                .get_sorted_daily_session_rows()
+                .get(self.selected_index)
+                .map(|row| {
+                    format!(
+                        "{} / {} / {}: {} requests, {} tokens, ${:.4}",
+                        row.source,
+                        row.model,
+                        row.session_id,
+                        row.requests,
+                        row.tokens.total(),
+                        row.cost
+                    )
+                }),
             Tab::Daily if self.is_daily_detail_active() => self
                 .get_sorted_daily_detail_rows()
                 .get(self.selected_index)
@@ -1672,8 +1914,46 @@ impl App {
         self.selected_daily_detail_date.is_some()
     }
 
+    pub fn is_daily_model_detail_active(&self) -> bool {
+        self.selected_daily_model_detail.is_some()
+    }
+
+    pub fn is_daily_session_detail_active(&self) -> bool {
+        self.selected_daily_session_detail.is_some()
+    }
+
     pub fn daily_detail_date(&self) -> Option<NaiveDate> {
         self.selected_daily_detail_date
+    }
+
+    pub fn daily_model_detail_title(&self) -> Option<&str> {
+        self.selected_daily_model_detail
+            .as_ref()
+            .map(|selection| selection.model.as_str())
+    }
+
+    pub fn daily_session_detail_title(&self) -> Option<&str> {
+        self.selected_daily_session_detail
+            .as_ref()
+            .map(|selection| selection.session_id.as_str())
+    }
+
+    fn daily_detail_row_exists(&self, selection: &DailyModelDetailSelection) -> bool {
+        self.data
+            .daily
+            .iter()
+            .find(|day| day.date == selection.date)
+            .and_then(|day| day.source_breakdown.get(&selection.source))
+            .is_some_and(|source| source.models.contains_key(&selection.model_key))
+    }
+
+    fn daily_session_row_exists(&self, selection: &DailySessionDetailSelection) -> bool {
+        self.data.messages.iter().any(|message| {
+            message.date == selection.date
+                && message.source == selection.source
+                && message.model_key == selection.model_key
+                && message.session_id == selection.session_id
+        })
     }
 
     pub fn get_sorted_daily_detail_rows(&self) -> Vec<DailyDetailRow<'_>> {
@@ -1690,9 +1970,10 @@ impl App {
             .flat_map(|(source, source_info)| {
                 source_info
                     .models
-                    .values()
-                    .map(move |model_info| DailyDetailRow {
+                    .iter()
+                    .map(move |(model_key, model_info)| DailyDetailRow {
                         source,
+                        model_key,
                         provider: &model_info.provider,
                         model: &model_info.display_name,
                         color_key: &model_info.color_key,
@@ -1730,6 +2011,211 @@ impl App {
                     .then_with(|| tie_breaker(a, b))
             }),
             (SortField::Date, _) => rows.sort_by(tie_breaker),
+        }
+
+        rows
+    }
+
+    pub fn get_sorted_daily_session_rows(&self) -> Vec<DailySessionRow> {
+        let Some(selection) = self.selected_daily_model_detail.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut rows_by_session: HashMap<String, DailySessionRow> = HashMap::new();
+        let mut agents_by_session: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut dirs_by_session: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut preview_timestamp_by_session: HashMap<String, i64> = HashMap::new();
+
+        for message in self.data.messages.iter().filter(|message| {
+            message.date == selection.date
+                && message.source == selection.source
+                && message.model_key == selection.model_key
+        }) {
+            let entry =
+                rows_by_session
+                    .entry(message.session_id.clone())
+                    .or_insert_with(|| DailySessionRow {
+                        date: message.date,
+                        source: message.source.clone(),
+                        provider: message.provider.clone(),
+                        model_key: message.model_key.clone(),
+                        model: message.model.clone(),
+                        color_key: message.color_key.clone(),
+                        session_id: message.session_id.clone(),
+                        dirs: Vec::new(),
+                        agents: Vec::new(),
+                        preview: None,
+                        tokens: TokenBreakdown::default(),
+                        cost: 0.0,
+                        requests: 0,
+                        preview_requests: 0,
+                        message_count: 0,
+                        first_timestamp: message.timestamp,
+                        last_timestamp: message.timestamp,
+                    });
+
+            entry.tokens.input = entry.tokens.input.saturating_add(message.tokens.input);
+            entry.tokens.output = entry.tokens.output.saturating_add(message.tokens.output);
+            entry.tokens.cache_read = entry
+                .tokens
+                .cache_read
+                .saturating_add(message.tokens.cache_read);
+            entry.tokens.cache_write = entry
+                .tokens
+                .cache_write
+                .saturating_add(message.tokens.cache_write);
+            entry.tokens.reasoning = entry
+                .tokens
+                .reasoning
+                .saturating_add(message.tokens.reasoning);
+            entry.cost += message.cost;
+            entry.requests = entry.requests.saturating_add(1);
+            entry.message_count = entry
+                .message_count
+                .saturating_add(message.message_count as u64);
+            entry.first_timestamp = entry.first_timestamp.min(message.timestamp);
+            entry.last_timestamp = entry.last_timestamp.max(message.timestamp);
+
+            if let Some(agent) = message.agent.as_ref() {
+                agents_by_session
+                    .entry(message.session_id.clone())
+                    .or_default()
+                    .insert(agent.clone());
+            }
+
+            if let Some(dir) = message
+                .workspace_label
+                .as_ref()
+                .or(message.workspace_key.as_ref())
+            {
+                dirs_by_session
+                    .entry(message.session_id.clone())
+                    .or_default()
+                    .insert(dir.clone());
+            }
+
+            if let Some(preview) = message.content_preview.as_ref() {
+                entry.preview_requests = entry.preview_requests.saturating_add(1);
+                let should_replace = preview_timestamp_by_session
+                    .get(&message.session_id)
+                    .is_none_or(|timestamp| message.timestamp < *timestamp);
+                if should_replace {
+                    preview_timestamp_by_session
+                        .insert(message.session_id.clone(), message.timestamp);
+                    entry.preview = Some(preview.clone());
+                }
+            }
+        }
+
+        let mut rows: Vec<DailySessionRow> = rows_by_session
+            .into_iter()
+            .map(|(session_id, mut row)| {
+                row.agents = agents_by_session
+                    .remove(&session_id)
+                    .map(|agents| agents.into_iter().collect())
+                    .unwrap_or_default();
+                row.dirs = dirs_by_session
+                    .remove(&session_id)
+                    .map(|dirs| dirs.into_iter().collect())
+                    .unwrap_or_default();
+                row
+            })
+            .collect();
+
+        let tie_breaker = |a: &DailySessionRow, b: &DailySessionRow| {
+            b.last_timestamp
+                .cmp(&a.last_timestamp)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        };
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => {
+                rows.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Cost, SortDirection::Ascending) => {
+                rows.sort_by(|a, b| a.cost.total_cmp(&b.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Tokens, SortDirection::Descending) => rows.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => rows.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, SortDirection::Descending) => rows.sort_by(|a, b| {
+                b.last_timestamp
+                    .cmp(&a.last_timestamp)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            }),
+            (SortField::Date, SortDirection::Ascending) => rows.sort_by(|a, b| {
+                a.last_timestamp
+                    .cmp(&b.last_timestamp)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            }),
+        }
+
+        rows
+    }
+
+    pub fn get_sorted_daily_message_rows(&self) -> Vec<&super::data::MessageUsage> {
+        let Some(selection) = self.selected_daily_session_detail.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut rows: Vec<&super::data::MessageUsage> = self
+            .data
+            .messages
+            .iter()
+            .filter(|message| {
+                message.date == selection.date
+                    && message.source == selection.source
+                    && message.model_key == selection.model_key
+                    && message.session_id == selection.session_id
+                    && message.content_preview.is_some()
+            })
+            .collect();
+
+        let tie_breaker = |a: &&super::data::MessageUsage, b: &&super::data::MessageUsage| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+                .then_with(|| a.agent.cmp(&b.agent))
+        };
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => {
+                rows.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Cost, SortDirection::Ascending) => {
+                rows.sort_by(|a, b| a.cost.total_cmp(&b.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Tokens, SortDirection::Descending) => rows.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => rows.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, SortDirection::Descending) => rows.sort_by(|a, b| {
+                b.timestamp
+                    .cmp(&a.timestamp)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            }),
+            (SortField::Date, SortDirection::Ascending) => rows.sort_by(|a, b| {
+                a.timestamp
+                    .cmp(&b.timestamp)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            }),
         }
 
         rows
@@ -2068,7 +2554,9 @@ fn sanitize_codex_login_line(line: &str) -> String {
 mod tests {
     use super::super::ui::widgets::get_provider_shade;
     use super::*;
-    use crate::tui::data::{DailyModelInfo, DailySourceInfo, ModelUsage, TokenBreakdown};
+    use crate::tui::data::{
+        DailyModelInfo, DailySourceInfo, MessageUsage, ModelUsage, TokenBreakdown,
+    };
     use chrono::{NaiveDate, NaiveDateTime};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2449,6 +2937,43 @@ mod tests {
             source_breakdown,
             message_count: 1,
             turn_count: 1,
+        }
+    }
+
+    fn message_usage_with_session(
+        date: &str,
+        source: &str,
+        model_key: &str,
+        model: &str,
+        session_id: &str,
+        timestamp: i64,
+        input_tokens: u64,
+        preview: Option<&str>,
+    ) -> MessageUsage {
+        MessageUsage {
+            date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            timestamp,
+            source: source.to_string(),
+            provider: "anthropic".to_string(),
+            model_key: model_key.to_string(),
+            model: model.to_string(),
+            color_key: model.to_string(),
+            session_id: session_id.to_string(),
+            workspace_key: None,
+            workspace_label: None,
+            agent: None,
+            content_preview: preview.map(str::to_string),
+            tokens: TokenBreakdown {
+                input: input_tokens,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            cost: 0.01,
+            message_count: 1,
+            duration_ms: None,
+            is_turn_start: true,
         }
     }
 
@@ -2844,6 +3369,89 @@ mod tests {
     }
 
     #[test]
+    fn test_enter_from_daily_detail_opens_session_then_request_rows_with_preview() {
+        let mut app = make_app();
+        app.current_tab = Tab::Daily;
+        app.sort_field = SortField::Date;
+        app.sort_direction = SortDirection::Descending;
+        app.data.daily = vec![daily_usage(
+            "2026-05-17",
+            7.0,
+            vec![("target-a", "anthropic", 5.0), ("target-b", "anthropic", 2.0)],
+        )];
+        app.data.messages = vec![
+            message_usage_with_session(
+                "2026-05-17",
+                "claude",
+                "target-a",
+                "target-a",
+                "session-a",
+                1_779_000_002_000,
+                50,
+                Some("please inspect the failing parser"),
+            ),
+            message_usage_with_session(
+                "2026-05-17",
+                "claude",
+                "target-a",
+                "target-a",
+                "session-a",
+                1_779_000_001_000,
+                20,
+                Some("add a focused regression test"),
+            ),
+            message_usage_with_session(
+                "2026-05-17",
+                "claude",
+                "target-b",
+                "target-b",
+                "session-b",
+                1_779_000_003_000,
+                100,
+                Some("not selected"),
+            ),
+        ];
+        app.data.messages[0].workspace_label = Some("repo-a".to_string());
+        app.data.messages[1].workspace_label = Some("repo-a".to_string());
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_daily_detail_active());
+        assert_eq!(app.get_current_list_len(), 2);
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_daily_model_detail_active());
+        assert!(!app.is_daily_session_detail_active());
+        let sessions = app.get_sorted_daily_session_rows();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "session-a");
+        assert_eq!(sessions[0].dirs, vec!["repo-a"]);
+        assert_eq!(
+            sessions[0].preview.as_deref(),
+            Some("add a focused regression test")
+        );
+        assert_eq!(sessions[0].requests, 2);
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_daily_session_detail_active());
+        let rows = app.get_sorted_daily_message_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].content_preview.as_deref(),
+            Some("please inspect the failing parser")
+        );
+        assert_eq!(rows[0].workspace_label.as_deref(), Some("repo-a"));
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.is_daily_model_detail_active());
+        assert!(!app.is_daily_session_detail_active());
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.is_daily_detail_active());
+        assert!(!app.is_daily_model_detail_active());
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.is_daily_detail_active());
+    }
+
+    #[test]
     fn test_close_daily_detail_reanchors_selection_by_date_after_sort_change() {
         let mut app = make_app();
         app.current_tab = Tab::Daily;
@@ -2994,9 +3602,13 @@ mod tests {
     }
 
     #[test]
-    fn test_switch_tab_restores_hourly_date_default() {
+    fn test_switch_tab_restores_time_tabs_date_default() {
         let mut app = make_app();
         assert_eq!(app.sort_field, SortField::Cost);
+
+        app.switch_tab(Tab::Daily);
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
 
         app.switch_tab(Tab::Hourly);
         assert_eq!(app.sort_field, SortField::Date);
@@ -3028,6 +3640,26 @@ mod tests {
     }
 
     #[test]
+    fn test_initial_daily_tab_uses_date_sort_default() {
+        let config = TuiConfig {
+            theme: "blue".to_string(),
+            refresh: 0,
+            sessions_path: None,
+            clients: None,
+            since: None,
+            until: None,
+            year: None,
+            initial_tab: Some(Tab::Daily),
+        };
+
+        let app = App::new_with_cached_data(config, None).unwrap();
+
+        assert_eq!(app.current_tab, Tab::Daily);
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+    }
+
+    #[test]
     fn test_switch_tab_preserves_user_sort() {
         let mut app = make_app();
         app.switch_tab(Tab::Models);
@@ -3037,7 +3669,8 @@ mod tests {
         assert_eq!(app.sort_direction, SortDirection::Descending);
 
         app.switch_tab(Tab::Daily);
-        assert_eq!(app.sort_field, SortField::Cost);
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
 
         app.switch_tab(Tab::Models);
         assert_eq!(app.sort_field, SortField::Tokens);
@@ -3049,8 +3682,11 @@ mod tests {
         let mut app = make_app();
 
         app.switch_tab(Tab::Daily);
-        app.set_sort(SortField::Date);
         assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+
+        app.set_sort(SortField::Tokens);
+        assert_eq!(app.sort_field, SortField::Tokens);
         assert_eq!(app.sort_direction, SortDirection::Descending);
 
         app.switch_tab(Tab::Hourly);
@@ -3058,7 +3694,7 @@ mod tests {
         assert_eq!(app.sort_direction, SortDirection::Descending);
 
         app.switch_tab(Tab::Daily);
-        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_field, SortField::Tokens);
         assert_eq!(app.sort_direction, SortDirection::Descending);
     }
 

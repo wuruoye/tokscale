@@ -34,6 +34,9 @@ pub mod warp;
 pub mod zed;
 
 use crate::TokenBreakdown;
+use serde_json::Value;
+
+const CONTENT_PREVIEW_MAX_CHARS: usize = 160;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UnifiedMessage {
@@ -53,6 +56,8 @@ pub struct UnifiedMessage {
     pub message_count: i32,
     pub agent: Option<String>,
     pub dedup_key: Option<String>,
+    #[serde(default)]
+    pub content_preview: Option<String>,
     /// True if this message is the first assistant response after a user turn.
     /// Used to count user interaction turns (as opposed to API message count).
     #[serde(default)]
@@ -295,6 +300,7 @@ impl UnifiedMessage {
             message_count: default_message_count(),
             agent,
             dedup_key,
+            content_preview: None,
             is_turn_start: false,
         }
     }
@@ -315,6 +321,65 @@ impl UnifiedMessage {
     pub(crate) fn set_timestamp(&mut self, timestamp: i64) {
         self.timestamp = timestamp;
         self.refresh_derived_fields();
+    }
+
+    pub fn set_content_preview(&mut self, preview: Option<String>) {
+        self.content_preview = preview;
+    }
+}
+
+pub(crate) fn content_preview_from_str(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut previous_was_space = false;
+    let mut truncated = false;
+
+    for ch in text.chars() {
+        if ch.is_control() && ch != '\n' && ch != '\t' && ch != '\r' {
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if !previous_was_space && !out.is_empty() {
+                out.push(' ');
+                previous_was_space = true;
+            }
+            continue;
+        }
+
+        if out.chars().count() >= CONTENT_PREVIEW_MAX_CHARS {
+            truncated = true;
+            break;
+        }
+
+        out.push(ch);
+        previous_was_space = false;
+    }
+
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if truncated {
+        Some(format!("{trimmed}..."))
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub(crate) fn content_preview_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => content_preview_from_str(text),
+        Value::Array(items) => items.iter().find_map(content_preview_from_value),
+        Value::Object(map) => {
+            for key in ["text", "content", "message", "input"] {
+                if let Some(preview) = map.get(key).and_then(content_preview_from_value) {
+                    return Some(preview);
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 

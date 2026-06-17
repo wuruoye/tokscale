@@ -395,6 +395,7 @@ mod tests {
             message_count: 1,
             agent: None,
             dedup_key: None,
+            content_preview: None,
             is_turn_start: false,
             duration_ms: None,
         }

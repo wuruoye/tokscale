@@ -133,6 +133,27 @@ pub struct MinutelyUsage {
 }
 
 #[derive(Debug, Clone)]
+pub struct MessageUsage {
+    pub date: NaiveDate,
+    pub timestamp: i64,
+    pub source: String,
+    pub provider: String,
+    pub model_key: String,
+    pub model: String,
+    pub color_key: String,
+    pub session_id: String,
+    pub workspace_key: Option<String>,
+    pub workspace_label: Option<String>,
+    pub agent: Option<String>,
+    pub content_preview: Option<String>,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub message_count: u32,
+    pub duration_ms: Option<i64>,
+    pub is_turn_start: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ContributionDay {
     pub date: NaiveDate,
     pub tokens: u64,
@@ -152,6 +173,7 @@ pub struct UsageData {
     pub daily: Vec<DailyUsage>,
     pub hourly: Vec<HourlyUsage>,
     pub minutely: Vec<MinutelyUsage>,
+    pub messages: Vec<MessageUsage>,
     pub graph: Option<GraphData>,
     pub total_tokens: u64,
     pub total_cost: f64,
@@ -195,6 +217,96 @@ fn positive_unified_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
         + tokens.cache_read.max(0)
         + tokens.cache_write.max(0)
         + tokens.reasoning.max(0)
+}
+
+fn positive_unified_token_breakdown(tokens: &tokscale_core::TokenBreakdown) -> TokenBreakdown {
+    TokenBreakdown {
+        input: tokens.input.max(0) as u64,
+        output: tokens.output.max(0) as u64,
+        cache_read: tokens.cache_read.max(0) as u64,
+        cache_write: tokens.cache_write.max(0) as u64,
+        reasoning: tokens.reasoning.max(0) as u64,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MessageRequestKey {
+    date: NaiveDate,
+    source: String,
+    provider: String,
+    model_key: String,
+    session_id: String,
+    agent: Option<String>,
+}
+
+impl From<&MessageUsage> for MessageRequestKey {
+    fn from(row: &MessageUsage) -> Self {
+        Self {
+            date: row.date,
+            source: row.source.clone(),
+            provider: row.provider.clone(),
+            model_key: row.model_key.clone(),
+            session_id: row.session_id.clone(),
+            agent: row.agent.clone(),
+        }
+    }
+}
+
+fn aggregate_message_rows_by_request(mut rows: Vec<MessageUsage>) -> Vec<MessageUsage> {
+    rows.sort_by(|a, b| {
+        a.date
+            .cmp(&b.date)
+            .then_with(|| a.source.cmp(&b.source))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.model_key.cmp(&b.model_key))
+            .then_with(|| a.agent.cmp(&b.agent))
+            .then_with(|| a.timestamp.cmp(&b.timestamp))
+    });
+
+    let mut grouped = Vec::with_capacity(rows.len());
+    let mut active_request: HashMap<MessageRequestKey, usize> = HashMap::new();
+
+    for row in rows {
+        let key = MessageRequestKey::from(&row);
+        let starts_request = row.content_preview.is_some() || row.is_turn_start;
+        if !starts_request {
+            if let Some(index) = active_request.get(&key).copied() {
+                merge_message_row(&mut grouped[index], row);
+                continue;
+            }
+        }
+
+        active_request.insert(key, grouped.len());
+        grouped.push(row);
+    }
+
+    grouped
+}
+
+fn merge_message_row(target: &mut MessageUsage, row: MessageUsage) {
+    target.tokens.input = target.tokens.input.saturating_add(row.tokens.input);
+    target.tokens.output = target.tokens.output.saturating_add(row.tokens.output);
+    target.tokens.cache_read = target.tokens.cache_read.saturating_add(row.tokens.cache_read);
+    target.tokens.cache_write = target
+        .tokens
+        .cache_write
+        .saturating_add(row.tokens.cache_write);
+    target.tokens.reasoning = target.tokens.reasoning.saturating_add(row.tokens.reasoning);
+    if row.cost.is_finite() {
+        target.cost += row.cost;
+    }
+    target.message_count = target.message_count.saturating_add(row.message_count);
+    target.duration_ms = match (target.duration_ms, row.duration_ms) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+    target.is_turn_start |= row.is_turn_start;
+    if target.content_preview.is_none() {
+        target.content_preview = row.content_preview;
+    }
 }
 
 fn workspace_model_display_label(workspace_label: &str, model: &str) -> String {
@@ -414,6 +526,7 @@ impl DataLoader {
         let mut daily_map: HashMap<NaiveDate, DailyUsage> = HashMap::new();
         let mut hourly_map: HashMap<NaiveDateTime, HourlyUsage> = HashMap::new();
         let mut minutely_map: HashMap<NaiveDateTime, MinutelyUsage> = HashMap::new();
+        let mut message_rows: Vec<MessageUsage> = Vec::with_capacity(messages.len());
         let mut model_session_ids: HashMap<String, HashSet<String>> = HashMap::new();
 
         for msg in &messages {
@@ -629,19 +742,23 @@ impl DataLoader {
                     &msg.provider_id,
                     &normalized_model,
                 );
+                let daily_message_model_key = daily_model_key.clone();
+                let daily_message_display_name = daily_source_model_display_name(
+                    group_by,
+                    &workspace_label,
+                    &msg.provider_id,
+                    &normalized_model,
+                );
+                let daily_message_color_key =
+                    model_color_key(group_by, &msg.provider_id, &normalized_model);
 
                 let model_info = source_entry
                     .models
                     .entry(daily_model_key)
                     .or_insert_with(|| DailyModelInfo {
                         provider: msg.provider_id.clone(),
-                        display_name: daily_source_model_display_name(
-                            group_by,
-                            &workspace_label,
-                            &msg.provider_id,
-                            &normalized_model,
-                        ),
-                        color_key: model_color_key(group_by, &msg.provider_id, &normalized_model),
+                        display_name: daily_message_display_name.clone(),
+                        color_key: daily_message_color_key.clone(),
                         tokens: TokenBreakdown::default(),
                         cost: 0.0,
                         messages: 0,
@@ -671,6 +788,29 @@ impl DataLoader {
                 model_info.messages = model_info
                     .messages
                     .saturating_add(msg.message_count.max(0) as u64);
+
+                let message_tokens = positive_unified_token_breakdown(&msg.tokens);
+                if message_tokens.total() > 0 || msg_cost > 0.0 {
+                    message_rows.push(MessageUsage {
+                        date,
+                        timestamp: msg.timestamp,
+                        source: msg.client.clone(),
+                        provider: msg.provider_id.clone(),
+                        model_key: daily_message_model_key,
+                        model: daily_message_display_name,
+                        color_key: daily_message_color_key,
+                        session_id: msg.session_id.clone(),
+                        workspace_key: msg.workspace_key.clone(),
+                        workspace_label: msg.workspace_label.clone(),
+                        agent: msg.agent.clone(),
+                        content_preview: msg.content_preview.clone(),
+                        tokens: message_tokens,
+                        cost: msg_cost,
+                        message_count: msg.message_count.max(0) as u32,
+                        duration_ms: msg.duration_ms,
+                        is_turn_start: msg.is_turn_start,
+                    });
+                }
             }
 
             // Hourly aggregation: derive hour from timestamp (Unix ms),
@@ -893,6 +1033,14 @@ impl DataLoader {
 
         let mut minutely: Vec<MinutelyUsage> = minutely_map.into_values().collect();
         minutely.sort_by_key(|b| std::cmp::Reverse(b.datetime));
+        let mut message_rows = aggregate_message_rows_by_request(message_rows);
+        message_rows.sort_by(|a, b| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.model.cmp(&b.model))
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
 
         let total_tokens: u64 = models.iter().map(|m| m.tokens.total()).sum();
         let total_cost: f64 = models
@@ -909,6 +1057,7 @@ impl DataLoader {
             daily,
             hourly,
             minutely,
+            messages: message_rows,
             graph: Some(graph),
             total_tokens,
             total_cost,
@@ -2485,6 +2634,87 @@ after"#,
             },
             cost,
         )
+    }
+
+    fn make_request_msg(
+        session_id: &str,
+        timestamp_ms: i64,
+        input: i64,
+        output: i64,
+        cost: f64,
+        preview: Option<&str>,
+        is_turn_start: bool,
+    ) -> UnifiedMessage {
+        let mut msg = UnifiedMessage::new(
+            "claude",
+            "claude-sonnet-4-5-20250929",
+            "anthropic",
+            session_id,
+            timestamp_ms,
+            tokscale_core::TokenBreakdown {
+                input,
+                output,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            cost,
+        );
+        msg.set_content_preview(preview.map(str::to_string));
+        msg.is_turn_start = is_turn_start;
+        msg
+    }
+
+    #[test]
+    fn test_aggregate_messages_groups_detail_rows_by_preview_request() {
+        let loader = DataLoader::new(None);
+        let usage = loader
+            .aggregate_messages(
+                vec![
+                    make_request_msg(
+                        "session-1",
+                        1_735_689_600_000,
+                        10,
+                        1,
+                        0.10,
+                        Some("first request"),
+                        true,
+                    ),
+                    make_request_msg("session-1", 1_735_689_601_000, 3, 2, 0.20, None, false),
+                    make_request_msg(
+                        "session-1",
+                        1_735_689_602_000,
+                        4,
+                        1,
+                        0.30,
+                        Some("second request"),
+                        true,
+                    ),
+                    make_request_msg("session-1", 1_735_689_603_000, 2, 3, 0.40, None, false),
+                ],
+                &GroupBy::Model,
+            )
+            .unwrap();
+
+        assert_eq!(usage.daily[0].message_count, 4);
+        assert_eq!(usage.messages.len(), 2);
+        assert_eq!(
+            usage.messages[0].content_preview.as_deref(),
+            Some("second request")
+        );
+        assert_eq!(usage.messages[0].tokens.input, 6);
+        assert_eq!(usage.messages[0].tokens.output, 4);
+        assert_eq!(usage.messages[0].message_count, 2);
+        assert!((usage.messages[0].cost - 0.70).abs() < 1e-9);
+
+        assert_eq!(
+            usage.messages[1].content_preview.as_deref(),
+            Some("first request")
+        );
+        assert_eq!(usage.messages[1].tokens.input, 13);
+        assert_eq!(usage.messages[1].tokens.output, 3);
+        assert_eq!(usage.messages[1].message_count, 2);
+        assert!((usage.messages[1].cost - 0.30).abs() < 1e-9);
     }
 
     #[test]

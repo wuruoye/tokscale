@@ -152,6 +152,12 @@ fn current_count_label(app: &App) -> String {
     match app.current_tab {
         Tab::Overview | Tab::Models => format!(" ({} models)", app.data.models.len()),
         Tab::Agents => format!(" ({} agents)", app.data.agents.len()),
+        Tab::Daily if app.is_daily_session_detail_active() => {
+            format!(" ({} requests)", app.get_sorted_daily_message_rows().len())
+        }
+        Tab::Daily if app.is_daily_model_detail_active() => {
+            format!(" ({} sessions)", app.get_sorted_daily_session_rows().len())
+        }
         Tab::Daily if app.is_daily_detail_active() => {
             format!(" ({} models)", app.get_sorted_daily_detail_rows().len())
         }
@@ -185,7 +191,15 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
         ];
         if app.current_tab == Tab::Daily {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
-            if app.is_daily_detail_active() {
+            if app.is_daily_session_detail_active() {
+                spans.push(Span::styled("esc", Style::default().fg(Color::Yellow)));
+            } else if app.is_daily_model_detail_active() {
+                spans.push(Span::styled("↵", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
+                spans.push(Span::styled("esc", Style::default().fg(Color::Yellow)));
+            } else if app.is_daily_detail_active() {
+                spans.push(Span::styled("↵", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
                 spans.push(Span::styled("esc", Style::default().fg(Color::Yellow)));
             } else {
                 spans.push(Span::styled("↵", Style::default().fg(Color::Yellow)));
@@ -208,7 +222,27 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" • ", Style::default().fg(app.theme.muted)),
         ];
         if app.current_tab == Tab::Daily {
-            if app.is_daily_detail_active() {
+            if app.is_daily_session_detail_active() {
+                spans.push(Span::styled(
+                    "[esc:back]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else if app.is_daily_model_detail_active() {
+                spans.push(Span::styled(
+                    "[enter:requests]",
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::styled(" ", Style::default()));
+                spans.push(Span::styled(
+                    "[esc:back]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else if app.is_daily_detail_active() {
+                spans.push(Span::styled(
+                    "[enter:sessions]",
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::styled(" ", Style::default()));
                 spans.push(Span::styled(
                     "[esc:back]",
                     Style::default().fg(Color::Yellow),

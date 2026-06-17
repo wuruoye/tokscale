@@ -10,9 +10,9 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-// 18: codex token_count dedup key scoped to the fork parent. Cached
-// messages store their dedup_key, so old entries must be reparsed.
-const CACHE_SCHEMA_VERSION: u32 = 18;
+// 19: cached UnifiedMessage entries now include content_preview. The cache is
+// bincode-backed, so adding a serialized struct field requires a schema bump.
+const CACHE_SCHEMA_VERSION: u32 = 19;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;

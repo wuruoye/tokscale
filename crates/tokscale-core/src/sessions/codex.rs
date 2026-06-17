@@ -6,7 +6,10 @@
 use super::utils::{
     extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
 };
-use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
+use super::{
+    content_preview_from_str, content_preview_from_value, normalize_workspace_key,
+    workspace_label_from_key, UnifiedMessage,
+};
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
@@ -186,6 +189,8 @@ pub(crate) struct CodexParseState {
     /// keeps a pending turn alive across incremental re-parses of appended chunks.
     #[serde(default)]
     pub pending_turn_start: bool,
+    #[serde(default)]
+    pub pending_content_preview: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +406,8 @@ fn parse_codex_reader<R: BufRead>(
                 {
                     if codex_message_is_human_turn(payload.message.as_deref()) {
                         state.pending_turn_start = true;
+                        state.pending_content_preview =
+                            payload.message.as_deref().and_then(content_preview_from_str);
                     }
                     handled = true;
                 }
@@ -531,6 +538,7 @@ fn parse_codex_reader<R: BufRead>(
                         message.is_turn_start = true;
                         state.pending_turn_start = false;
                     }
+                    message.set_content_preview(state.pending_content_preview.take());
                     if parsed_timestamp.is_some() || total_usage.is_some() {
                         // Fork/subagent children replay the same upstream
                         // token_count history into many sibling files. Those
@@ -959,23 +967,33 @@ fn parse_codex_headless_line(
         session_agent.clone()
     };
 
+    let mut message = UnifiedMessage::new_with_agent(
+        "codex",
+        model,
+        provider,
+        session_id.to_string(),
+        timestamp,
+        TokenBreakdown {
+            input: usage.input.max(0),
+            output: usage.output.max(0),
+            cache_read: usage.cached.max(0),
+            cache_write: 0,
+            reasoning: 0,
+        },
+        0.0,
+        agent,
+    );
+    message.set_content_preview(
+        value
+            .get("input")
+            .or_else(|| value.get("prompt"))
+            .or_else(|| value.get("message"))
+            .or_else(|| value.get("data").and_then(|data| data.get("input")))
+            .and_then(content_preview_from_value),
+    );
+
     Some((
-        UnifiedMessage::new_with_agent(
-            "codex",
-            model,
-            provider,
-            session_id.to_string(),
-            timestamp,
-            TokenBreakdown {
-                input: usage.input.max(0),
-                output: usage.output.max(0),
-                cache_read: usage.cached.max(0),
-                cache_write: 0,
-                reasoning: 0,
-            },
-            0.0,
-            agent,
-        ),
+        message,
         usage.timestamp_ms.is_none(),
     ))
 }
@@ -2129,10 +2147,12 @@ mod tests {
             messages[0].is_turn_start,
             "first reply after a human user_message is a turn start"
         );
+        assert_eq!(messages[0].content_preview.as_deref(), Some("continue please"));
         assert!(
             !messages[1].is_turn_start,
             "a later reply with no new user_message is not a turn start"
         );
+        assert_eq!(messages[1].content_preview, None);
     }
 
     #[test]

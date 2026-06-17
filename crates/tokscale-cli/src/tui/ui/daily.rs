@@ -1,4 +1,4 @@
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, Table,
@@ -11,6 +11,11 @@ use super::widgets::{
 use crate::tui::app::{App, SortDirection, SortField};
 
 pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.is_daily_model_detail_active() {
+        render_message_detail(frame, app, area);
+        return;
+    }
+
     if app.is_daily_detail_active() {
         render_detail(frame, app, area);
         return;
@@ -315,6 +320,448 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+fn render_message_detail(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.is_daily_session_detail_active() {
+        render_request_detail(frame, app, area);
+    } else {
+        render_session_detail(frame, app, area);
+    }
+}
+
+fn render_session_detail(frame: &mut Frame, app: &mut App, area: Rect) {
+    let model = app.daily_model_detail_title().unwrap_or("Sessions");
+    let title = app
+        .daily_detail_date()
+        .map(|date| format!(" Daily Sessions: {} / {} ", date, truncate(model, 48)))
+        .unwrap_or_else(|| format!(" Daily Sessions: {} ", truncate(model, 48)));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(app.theme.background));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let visible_height = inner.height.saturating_sub(1) as usize;
+    app.set_max_visible_items(visible_height);
+
+    let rows_data = app.get_sorted_daily_session_rows();
+    if rows_data.is_empty() {
+        let empty_msg =
+            Paragraph::new("No sessions found for this model. Press Esc to go back.")
+                .style(Style::default().fg(app.theme.muted))
+                .alignment(Alignment::Center);
+        frame.render_widget(empty_msg, inner);
+        return;
+    }
+
+    let is_narrow = app.is_narrow();
+    let is_very_narrow = app.is_very_narrow();
+    let sort_field = app.sort_field;
+    let sort_direction = app.sort_direction;
+    let scroll_offset = app.scroll_offset;
+    let selected_index = app.selected_index;
+    let theme_accent = app.theme.accent;
+    let theme_muted = app.theme.muted;
+    let theme_selection = app.theme.selection;
+    let metric_input_style = app.theme.metric_input_style();
+    let metric_output_style = app.theme.metric_output_style();
+    let metric_cache_read_style = app.theme.metric_cache_read_style();
+    let striped_row_style = app.theme.striped_row_style();
+
+    let header_cells = if is_very_narrow {
+        vec!["Dir", "Tok"]
+    } else if is_narrow {
+        vec!["Dir", "Tok", "Preview"]
+    } else {
+        vec![
+            "#", "Last", "Dir", "Input", "Output", "Cache", "Cachex", "Total", "Cost",
+            "Preview",
+        ]
+    };
+
+    let sort_indicator = |field: SortField| -> &'static str {
+        if sort_field == field {
+            match sort_direction {
+                SortDirection::Ascending => " ▲",
+                SortDirection::Descending => " ▼",
+            }
+        } else {
+            ""
+        }
+    };
+
+    let header = Row::new(
+        header_cells
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let indicator = match (i, is_narrow, is_very_narrow) {
+                    (1, _, true) => sort_indicator(SortField::Tokens),
+                    (1, true, false) => sort_indicator(SortField::Tokens),
+                    (7, false, false) => sort_indicator(SortField::Tokens),
+                    (8, false, false) => sort_indicator(SortField::Cost),
+                    (1, false, false) => sort_indicator(SortField::Date),
+                    _ => "",
+                };
+                Cell::from(format!("{}{}", h, indicator))
+            })
+            .collect::<Vec<_>>(),
+    )
+    .style(
+        Style::default()
+            .fg(theme_accent)
+            .add_modifier(Modifier::BOLD),
+    )
+    .height(1);
+
+    let detail_len = rows_data.len();
+    let start = scroll_offset.min(detail_len);
+    let end = (start + visible_height).min(detail_len);
+
+    if start >= detail_len {
+        return;
+    }
+
+    let rows: Vec<Row> = rows_data[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let idx = i + start;
+            let is_selected = idx == selected_index;
+            let is_striped = idx % 2 == 1;
+            let preview = row.preview.as_deref().unwrap_or("\u{2014}");
+            let dir = joined_dirs(&row.dirs);
+            let model_color = app.model_color_for(&row.provider, &row.color_key);
+            let cache_tokens = row.tokens.cache_read.saturating_add(row.tokens.cache_write);
+
+            let cells: Vec<Cell> = if is_very_narrow {
+                vec![
+                    Cell::from(truncate(&dir, 10)).style(Style::default().fg(model_color)),
+                    Cell::from(format_tokens(row.tokens.total())),
+                ]
+            } else if is_narrow {
+                vec![
+                    Cell::from(truncate(&dir, 12)).style(Style::default().fg(model_color)),
+                    Cell::from(format_tokens(row.tokens.total())),
+                    Cell::from(truncate(preview, 36)).style(Style::default().fg(theme_muted)),
+                ]
+            } else {
+                vec![
+                    Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
+                    Cell::from(format_message_time(row.last_timestamp, false))
+                        .style(Style::default().fg(model_color)),
+                    Cell::from(truncate(&dir, 18)).style(Style::default().fg(theme_muted)),
+                    Cell::from(format_tokens(row.tokens.input)).style(metric_input_style),
+                    Cell::from(format_tokens(row.tokens.output)).style(metric_output_style),
+                    Cell::from(format_tokens(cache_tokens)).style(metric_cache_read_style),
+                    Cell::from(format_cache_hit_rate(
+                        row.tokens.cache_read,
+                        row.tokens.input,
+                        row.tokens.cache_write,
+                    ))
+                    .style(Style::default().fg(Color::Cyan)),
+                    Cell::from(format_tokens(row.tokens.total())),
+                    Cell::from(format_cost(row.cost)).style(Style::default().fg(Color::Green)),
+                    Cell::from(truncate(preview, 56)).style(Style::default().fg(theme_muted)),
+                ]
+            };
+
+            let row_style = if is_selected {
+                Style::default().bg(theme_selection)
+            } else if is_striped {
+                striped_row_style
+            } else {
+                Style::default()
+            };
+
+            Row::new(cells).style(row_style).height(1)
+        })
+        .collect();
+
+    let widths = if is_very_narrow {
+        vec![Constraint::Percentage(55), Constraint::Percentage(45)]
+    } else if is_narrow {
+        vec![
+            Constraint::Length(12),
+            Constraint::Length(8),
+            Constraint::Min(16),
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(8),
+            Constraint::Length(18),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Min(20),
+        ]
+    };
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(Style::default().bg(theme_selection));
+
+    frame.render_widget(table, inner);
+
+    if detail_len > visible_height {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"));
+
+        let mut scrollbar_state =
+            viewport_scrollbar_state(detail_len, scroll_offset, visible_height);
+
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut scrollbar_state,
+        );
+    }
+}
+
+fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
+    let model = app.daily_model_detail_title().unwrap_or("Requests");
+    let session = app.daily_session_detail_title().unwrap_or("Session");
+    let title = app
+        .daily_detail_date()
+        .map(|date| {
+            format!(
+                " Daily Requests: {} / {} / {} ",
+                date,
+                truncate(model, 32),
+                truncate(session, 24)
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                " Daily Requests: {} / {} ",
+                truncate(model, 32),
+                truncate(session, 24)
+            )
+        });
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(app.theme.background));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let visible_height = inner.height.saturating_sub(1) as usize;
+    app.set_max_visible_items(visible_height);
+
+    let rows_data = app.get_sorted_daily_message_rows();
+    if rows_data.is_empty() {
+        let empty_msg =
+            Paragraph::new("No request details found for this model. Press Esc to go back.")
+                .style(Style::default().fg(app.theme.muted))
+                .alignment(Alignment::Center);
+        frame.render_widget(empty_msg, inner);
+        return;
+    }
+
+    let is_narrow = app.is_narrow();
+    let is_very_narrow = app.is_very_narrow();
+    let sort_field = app.sort_field;
+    let sort_direction = app.sort_direction;
+    let scroll_offset = app.scroll_offset;
+    let selected_index = app.selected_index;
+    let theme_accent = app.theme.accent;
+    let theme_muted = app.theme.muted;
+    let theme_selection = app.theme.selection;
+    let metric_input_style = app.theme.metric_input_style();
+    let metric_output_style = app.theme.metric_output_style();
+    let metric_cache_read_style = app.theme.metric_cache_read_style();
+    let metric_cache_write_style = app.theme.metric_cache_write_style();
+    let striped_row_style = app.theme.striped_row_style();
+
+    let header_cells = if is_very_narrow {
+        vec!["Time", "Tok"]
+    } else if is_narrow {
+        vec!["Time", "Dir", "Tok", "Preview"]
+    } else {
+        vec![
+            "#", "Time", "Dir", "Input", "Output", "Cache R", "Cache W", "Cachex", "Total",
+            "Cost", "Preview",
+        ]
+    };
+
+    let sort_indicator = |field: SortField| -> &'static str {
+        if sort_field == field {
+            match sort_direction {
+                SortDirection::Ascending => " ▲",
+                SortDirection::Descending => " ▼",
+            }
+        } else {
+            ""
+        }
+    };
+
+    let header = Row::new(
+        header_cells
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let indicator = match (i, is_narrow, is_very_narrow) {
+                    (1, _, true) => sort_indicator(SortField::Tokens),
+                    (2, true, false) => sort_indicator(SortField::Tokens),
+                    (8, false, false) => sort_indicator(SortField::Tokens),
+                    (9, false, false) => sort_indicator(SortField::Cost),
+                    (1, false, false) => sort_indicator(SortField::Date),
+                    (0, true, false) | (0, _, true) => sort_indicator(SortField::Date),
+                    _ => "",
+                };
+                Cell::from(format!("{}{}", h, indicator))
+            })
+            .collect::<Vec<_>>(),
+    )
+    .style(
+        Style::default()
+            .fg(theme_accent)
+            .add_modifier(Modifier::BOLD),
+    )
+    .height(1);
+
+    let detail_len = rows_data.len();
+    let start = scroll_offset.min(detail_len);
+    let end = (start + visible_height).min(detail_len);
+
+    if start >= detail_len {
+        return;
+    }
+
+    let rows: Vec<Row> = rows_data[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let idx = i + start;
+            let is_selected = idx == selected_index;
+            let is_striped = idx % 2 == 1;
+            let preview = row.content_preview.as_deref().unwrap_or("\u{2014}");
+            let dir = message_dir(row.workspace_label.as_deref(), row.workspace_key.as_deref());
+            let model_color = app.model_color_for(&row.provider, &row.color_key);
+
+            let cells: Vec<Cell> = if is_very_narrow {
+                vec![
+                    Cell::from(format_message_time(row.timestamp, true))
+                        .style(Style::default().fg(model_color)),
+                    Cell::from(format_tokens(row.tokens.total())),
+                ]
+            } else if is_narrow {
+                vec![
+                    Cell::from(format_message_time(row.timestamp, true))
+                        .style(Style::default().fg(model_color)),
+                    Cell::from(truncate(dir, 12)).style(Style::default().fg(theme_muted)),
+                    Cell::from(format_tokens(row.tokens.total())),
+                    Cell::from(truncate(preview, 36)).style(Style::default().fg(theme_muted)),
+                ]
+            } else {
+                vec![
+                    Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
+                    Cell::from(format_message_time(row.timestamp, false))
+                        .style(Style::default().fg(model_color)),
+                    Cell::from(truncate(dir, 18)).style(Style::default().fg(theme_muted)),
+                    Cell::from(format_tokens(row.tokens.input)).style(metric_input_style),
+                    Cell::from(format_tokens(row.tokens.output)).style(metric_output_style),
+                    Cell::from(format_tokens(row.tokens.cache_read)).style(metric_cache_read_style),
+                    Cell::from(format_tokens(row.tokens.cache_write))
+                        .style(metric_cache_write_style),
+                    Cell::from(format_cache_hit_rate(
+                        row.tokens.cache_read,
+                        row.tokens.input,
+                        row.tokens.cache_write,
+                    ))
+                    .style(Style::default().fg(Color::Cyan)),
+                    Cell::from(format_tokens(row.tokens.total())),
+                    Cell::from(format_cost(row.cost)).style(Style::default().fg(Color::Green)),
+                    Cell::from(truncate(preview, 64)).style(Style::default().fg(theme_muted)),
+                ]
+            };
+
+            let row_style = if is_selected {
+                Style::default().bg(theme_selection)
+            } else if is_striped {
+                striped_row_style
+            } else {
+                Style::default()
+            };
+
+            Row::new(cells).style(row_style).height(1)
+        })
+        .collect();
+
+    let widths = if is_very_narrow {
+        vec![Constraint::Percentage(45), Constraint::Percentage(55)]
+    } else if is_narrow {
+        vec![
+            Constraint::Length(6),
+            Constraint::Length(12),
+            Constraint::Length(8),
+            Constraint::Min(16),
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(8),
+            Constraint::Length(18),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(24),
+        ]
+    };
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(Style::default().bg(theme_selection));
+
+    frame.render_widget(table, inner);
+
+    if detail_len > visible_height {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"));
+
+        let mut scrollbar_state =
+            viewport_scrollbar_state(detail_len, scroll_offset, visible_height);
+
+        frame.render_stateful_widget(
+            scrollbar,
+            area.inner(Margin {
+                horizontal: 0,
+                vertical: 1,
+            }),
+            &mut scrollbar_state,
+        );
+    }
+}
+
 fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = app
         .daily_detail_date()
@@ -537,6 +984,35 @@ fn render_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             }),
             &mut scrollbar_state,
         );
+    }
+}
+
+fn joined_dirs(dirs: &[String]) -> String {
+    if dirs.is_empty() {
+        "\u{2014}".to_string()
+    } else {
+        dirs.join(", ")
+    }
+}
+
+fn message_dir<'a>(workspace_label: Option<&'a str>, workspace_key: Option<&'a str>) -> &'a str {
+    workspace_label.or(workspace_key).unwrap_or("\u{2014}")
+}
+
+fn format_message_time(timestamp_ms: i64, compact: bool) -> String {
+    if timestamp_ms <= 0 {
+        return "\u{2014}".to_string();
+    }
+
+    match Local.timestamp_millis_opt(timestamp_ms) {
+        chrono::LocalResult::Single(dt) => {
+            if compact {
+                dt.format("%H:%M").to_string()
+            } else {
+                dt.format("%H:%M:%S").to_string()
+            }
+        }
+        _ => "\u{2014}".to_string(),
     }
 }
 

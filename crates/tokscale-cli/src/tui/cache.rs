@@ -16,12 +16,12 @@ use crate::ClientFilter;
 
 use super::data::{
     AgentUsage, ContributionDay, DailyModelInfo, DailySourceInfo, DailyUsage, GraphData,
-    HourlyModelInfo, HourlyUsage, ModelUsage, TokenBreakdown, UsageData,
+    HourlyModelInfo, HourlyUsage, MessageUsage, ModelUsage, TokenBreakdown, UsageData,
 };
 
 /// Cache staleness threshold: 5 minutes (matches TS implementation)
 const CACHE_STALE_THRESHOLD_MS: u64 = 5 * 60 * 1000;
-const CACHE_SCHEMA_VERSION: u32 = 9;
+const CACHE_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +107,8 @@ struct CachedUsageData {
     daily: Vec<CachedDailyUsage>,
     #[serde(default)]
     hourly: Vec<CachedHourlyUsage>,
+    #[serde(default)]
+    messages: Vec<CachedMessageUsage>,
     graph: Option<CachedGraphData>,
     total_tokens: u64,
     total_cost: f64,
@@ -217,6 +219,34 @@ struct CachedHourlyUsage {
     message_count: u32,
     #[serde(default)]
     turn_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedMessageUsage {
+    date: String,
+    timestamp: i64,
+    source: String,
+    provider: String,
+    model_key: String,
+    model: String,
+    color_key: String,
+    session_id: String,
+    #[serde(default)]
+    workspace_key: Option<String>,
+    #[serde(default)]
+    workspace_label: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    content_preview: Option<String>,
+    tokens: CachedTokenBreakdown,
+    cost: f64,
+    message_count: u32,
+    #[serde(default)]
+    duration_ms: Option<i64>,
+    #[serde(default)]
+    is_turn_start: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,6 +494,57 @@ impl TryFrom<CachedHourlyUsage> for HourlyUsage {
     }
 }
 
+impl From<&MessageUsage> for CachedMessageUsage {
+    fn from(m: &MessageUsage) -> Self {
+        Self {
+            date: m.date.to_string(),
+            timestamp: m.timestamp,
+            source: m.source.clone(),
+            provider: m.provider.clone(),
+            model_key: m.model_key.clone(),
+            model: m.model.clone(),
+            color_key: m.color_key.clone(),
+            session_id: m.session_id.clone(),
+            workspace_key: m.workspace_key.clone(),
+            workspace_label: m.workspace_label.clone(),
+            agent: m.agent.clone(),
+            content_preview: m.content_preview.clone(),
+            tokens: (&m.tokens).into(),
+            cost: m.cost,
+            message_count: m.message_count,
+            duration_ms: m.duration_ms,
+            is_turn_start: m.is_turn_start,
+        }
+    }
+}
+
+impl TryFrom<CachedMessageUsage> for MessageUsage {
+    type Error = chrono::ParseError;
+
+    fn try_from(m: CachedMessageUsage) -> Result<Self, Self::Error> {
+        use chrono::NaiveDate;
+        Ok(Self {
+            date: NaiveDate::parse_from_str(&m.date, "%Y-%m-%d")?,
+            timestamp: m.timestamp,
+            source: m.source,
+            provider: m.provider,
+            model_key: m.model_key,
+            model: m.model,
+            color_key: m.color_key,
+            session_id: m.session_id,
+            workspace_key: m.workspace_key,
+            workspace_label: m.workspace_label,
+            agent: m.agent,
+            content_preview: m.content_preview,
+            tokens: m.tokens.into(),
+            cost: m.cost,
+            message_count: m.message_count,
+            duration_ms: m.duration_ms,
+            is_turn_start: m.is_turn_start,
+        })
+    }
+}
+
 impl From<&DailyUsage> for CachedDailyUsage {
     fn from(d: &DailyUsage) -> Self {
         Self {
@@ -608,6 +689,7 @@ impl From<&UsageData> for CachedUsageData {
             agents: u.agents.iter().map(|a| a.into()).collect(),
             daily: u.daily.iter().map(|d| d.into()).collect(),
             hourly: u.hourly.iter().map(|h| h.into()).collect(),
+            messages: u.messages.iter().map(|m| m.into()).collect(),
             graph: u.graph.as_ref().map(|g| g.into()),
             total_tokens: u.total_tokens,
             total_cost: u.total_cost,
@@ -624,6 +706,8 @@ impl TryFrom<CachedUsageData> for UsageData {
         let daily: Result<Vec<DailyUsage>, _> = u.daily.into_iter().map(|d| d.try_into()).collect();
         let hourly: Result<Vec<HourlyUsage>, _> =
             u.hourly.into_iter().map(|h| h.try_into()).collect();
+        let messages: Result<Vec<MessageUsage>, _> =
+            u.messages.into_iter().map(|m| m.try_into()).collect();
         let graph: Option<Result<GraphData, _>> = u.graph.map(|g| g.try_into());
 
         Ok(Self {
@@ -635,6 +719,7 @@ impl TryFrom<CachedUsageData> for UsageData {
             // not worth round-tripping through the on-disk cache); the
             // first foreground refresh after cache hit will populate it.
             minutely: Vec::new(),
+            messages: messages?,
             graph: graph.transpose()?,
             total_tokens: u.total_tokens,
             total_cost: u.total_cost,
@@ -1117,7 +1202,7 @@ mod tests {
         fs::write(
             &cache_path,
             r#"{
-  "schemaVersion": 9,
+  "schemaVersion": 12,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,
@@ -1440,7 +1525,7 @@ mod tests {
         fs::write(
             &cache_path,
             r#"{
-  "schemaVersion": 9,
+  "schemaVersion": 12,
   "timestamp": 9999999999999,
   "enabledClients": ["claude", "cursor"],
   "includeSynthetic": false,
@@ -1722,7 +1807,7 @@ mod tests {
         fs::write(
             &legacy_path,
             r#"{
-  "schemaVersion": 9,
+  "schemaVersion": 12,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,

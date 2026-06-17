@@ -8,7 +8,7 @@ use super::utils::{
     extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
     read_file_or_none,
 };
-use super::UnifiedMessage;
+use super::{content_preview_from_value, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,6 +41,7 @@ pub struct GeminiMessage {
     pub message_type: String,
     pub tokens: Option<Value>,
     pub model: Option<String>,
+    pub content: Option<Value>,
 }
 
 fn first_i64(value: &Value, keys: &[&str]) -> Option<i64> {
@@ -182,8 +183,13 @@ pub(crate) fn parse_gemini_file_with_cache_status(path: &Path) -> GeminiParseRes
 fn parse_gemini_session(session: GeminiSession, fallback_timestamp: i64) -> Vec<UnifiedMessage> {
     let mut messages = Vec::with_capacity(session.messages.len());
     let session_id = session.session_id.clone();
+    let mut pending_content_preview: Option<String> = None;
 
     for msg in session.messages {
+        if msg.message_type == "user" {
+            pending_content_preview = msg.content.as_ref().and_then(content_preview_from_value);
+        }
+
         // Only process messages with token data
         let tokens = match msg.tokens.as_ref().and_then(deserialize_tokens) {
             Some(t) => t,
@@ -194,6 +200,9 @@ fn parse_gemini_session(session: GeminiSession, fallback_timestamp: i64) -> Vec<
             Some(m) => m,
             None => continue,
         };
+        let content_preview = pending_content_preview
+            .take()
+            .or_else(|| msg.content.as_ref().and_then(content_preview_from_value));
 
         let timestamp = msg
             .timestamp
@@ -205,6 +214,7 @@ fn parse_gemini_session(session: GeminiSession, fallback_timestamp: i64) -> Vec<
             &session_id,
             timestamp,
             tokens,
+            content_preview,
         ));
     }
 
@@ -216,6 +226,7 @@ fn build_gemini_token_message(
     session_id: &str,
     timestamp: i64,
     tokens: GeminiTokens,
+    content_preview: Option<String>,
 ) -> UnifiedMessage {
     let (input, cache_read) = normalize_gemini_session_input_and_cache(
         tokens.input.unwrap_or(0),
@@ -228,7 +239,7 @@ fn build_gemini_token_message(
 
     let tool = tokens.tool.unwrap_or(0).max(0);
 
-    UnifiedMessage::new(
+    let mut message = UnifiedMessage::new(
         "gemini",
         model,
         "google",
@@ -242,7 +253,9 @@ fn build_gemini_token_message(
             reasoning: tokens.thoughts.unwrap_or(0).max(0),
         },
         0.0,
-    )
+    );
+    message.set_content_preview(content_preview);
+    message
 }
 
 fn parse_direct_gemini_token_message(
@@ -250,14 +263,20 @@ fn parse_direct_gemini_token_message(
     model_hint: Option<String>,
     session_id: &str,
     fallback_timestamp: i64,
+    pending_content_preview: Option<String>,
 ) -> Option<UnifiedMessage> {
     let model = extract_string(value.get("model")).or(model_hint)?;
     let tokens_value = value.get("tokens")?;
     let tokens = deserialize_tokens(tokens_value)?;
     let timestamp = extract_timestamp_from_value(value).unwrap_or(fallback_timestamp);
+    let content_preview = pending_content_preview.or_else(|| extract_gemini_content_preview(value));
 
     Some(build_gemini_token_message(
-        model, session_id, timestamp, tokens,
+        model,
+        session_id,
+        timestamp,
+        tokens,
+        content_preview,
     ))
 }
 
@@ -284,6 +303,7 @@ fn parse_gemini_headless_jsonl(path: &Path, fallback_timestamp: i64) -> GeminiPa
     let mut line_buffer = Vec::with_capacity(4096);
     let mut json_buffer = Vec::with_capacity(4096);
     let mut skipped_malformed_line = false;
+    let mut pending_content_preview: Option<String> = None;
 
     loop {
         line_buffer.clear();
@@ -326,6 +346,11 @@ fn parse_gemini_headless_jsonl(path: &Path, fallback_timestamp: i64) -> GeminiPa
             continue;
         }
 
+        if event_type == "user" {
+            pending_content_preview = extract_gemini_content_preview(&value);
+            continue;
+        }
+
         if let Some(id) = extract_string(value.get("session_id").or_else(|| value.get("sessionId")))
         {
             session_id = id;
@@ -336,11 +361,13 @@ fn parse_gemini_headless_jsonl(path: &Path, fallback_timestamp: i64) -> GeminiPa
                 current_model = Some(model);
             }
 
+            let content_preview = pending_content_preview.take();
             if let Some(message) = parse_direct_gemini_token_message(
                 &value,
                 current_model.clone(),
                 &session_id,
                 fallback_timestamp,
+                content_preview,
             ) {
                 if let Some(id) = extract_string(value.get("id")) {
                     if let Some(index) = direct_message_indices.get(&id).copied() {
@@ -400,7 +427,7 @@ fn parse_gemini_headless_value(
         || value.get("tokens").is_some()
     {
         if let Some(message) =
-            parse_direct_gemini_token_message(value, None, session_id, fallback_timestamp)
+            parse_direct_gemini_token_message(value, None, session_id, fallback_timestamp, None)
         {
             return vec![message];
         }
@@ -418,6 +445,12 @@ fn parse_gemini_headless_value(
     let timestamp = extract_timestamp_from_value(value).unwrap_or(fallback_timestamp);
 
     build_messages_from_stats(stats, model_hint, session_id, timestamp)
+}
+
+fn extract_gemini_content_preview(value: &Value) -> Option<String> {
+    ["input", "prompt", "message", "content"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(content_preview_from_value))
 }
 
 fn build_messages_from_stats(
@@ -657,6 +690,7 @@ mod tests {
         assert_eq!(messages[0].model_id, "gemini-2.0-flash");
         assert_eq!(messages[0].tokens.input, 10);
         assert_eq!(messages[0].tokens.output, 20);
+        assert_eq!(messages[0].content_preview.as_deref(), Some("Hello"));
     }
 
     #[test]
