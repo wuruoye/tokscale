@@ -1932,10 +1932,32 @@ impl App {
             .map(|selection| selection.model.as_str())
     }
 
-    pub fn daily_session_detail_title(&self) -> Option<&str> {
-        self.selected_daily_session_detail
-            .as_ref()
-            .map(|selection| selection.session_id.as_str())
+    pub fn daily_session_detail_dir_title(&self) -> Option<String> {
+        let selection = self.selected_daily_session_detail.as_ref()?;
+        let dirs: BTreeSet<String> = self
+            .data
+            .messages
+            .iter()
+            .filter(|message| {
+                message.date == selection.date
+                    && message.source == selection.source
+                    && message.model_key == selection.model_key
+                    && message.session_id == selection.session_id
+            })
+            .filter_map(|message| {
+                message
+                    .workspace_label
+                    .as_ref()
+                    .or(message.workspace_key.as_ref())
+                    .cloned()
+            })
+            .collect();
+
+        if dirs.is_empty() {
+            None
+        } else {
+            Some(dirs.into_iter().collect::<Vec<_>>().join(", "))
+        }
     }
 
     fn daily_detail_row_exists(&self, selection: &DailyModelDetailSelection) -> bool {
@@ -3433,6 +3455,10 @@ mod tests {
 
         app.handle_key_event(key(KeyCode::Enter));
         assert!(app.is_daily_session_detail_active());
+        assert_eq!(
+            app.daily_session_detail_dir_title().as_deref(),
+            Some("repo-a")
+        );
         let rows = app.get_sorted_daily_message_rows();
         assert_eq!(rows.len(), 2);
         assert_eq!(

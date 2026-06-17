@@ -536,7 +536,9 @@ fn render_session_detail(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let model = app.daily_model_detail_title().unwrap_or("Requests");
-    let session = app.daily_session_detail_title().unwrap_or("Session");
+    let dir = app
+        .daily_session_detail_dir_title()
+        .unwrap_or_else(|| "\u{2014}".to_string());
     let title = app
         .daily_detail_date()
         .map(|date| {
@@ -544,14 +546,14 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 " Daily Requests: {} / {} / {} ",
                 date,
                 truncate(model, 32),
-                truncate(session, 24)
+                truncate(&dir, 24)
             )
         })
         .unwrap_or_else(|| {
             format!(
                 " Daily Requests: {} / {} ",
                 truncate(model, 32),
-                truncate(session, 24)
+                truncate(&dir, 24)
             )
         });
 
@@ -600,11 +602,11 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     let header_cells = if is_very_narrow {
         vec!["Time", "Tok"]
     } else if is_narrow {
-        vec!["Time", "Dir", "Tok", "Preview"]
+        vec!["Time", "Tok", "Preview"]
     } else {
         vec![
-            "#", "Time", "Dir", "Input", "Output", "Cache R", "Cache W", "Cachex", "Total",
-            "Cost", "Preview",
+            "#", "Time", "Input", "Output", "Cache R", "Cache W", "Cachex", "Total", "Cost",
+            "Preview",
         ]
     };
 
@@ -626,9 +628,9 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|(i, h)| {
                 let indicator = match (i, is_narrow, is_very_narrow) {
                     (1, _, true) => sort_indicator(SortField::Tokens),
-                    (2, true, false) => sort_indicator(SortField::Tokens),
-                    (8, false, false) => sort_indicator(SortField::Tokens),
-                    (9, false, false) => sort_indicator(SortField::Cost),
+                    (1, true, false) => sort_indicator(SortField::Tokens),
+                    (7, false, false) => sort_indicator(SortField::Tokens),
+                    (8, false, false) => sort_indicator(SortField::Cost),
                     (1, false, false) => sort_indicator(SortField::Date),
                     (0, true, false) | (0, _, true) => sort_indicator(SortField::Date),
                     _ => "",
@@ -660,7 +662,6 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             let is_selected = idx == selected_index;
             let is_striped = idx % 2 == 1;
             let preview = row.content_preview.as_deref().unwrap_or("\u{2014}");
-            let dir = message_dir(row.workspace_label.as_deref(), row.workspace_key.as_deref());
             let model_color = app.model_color_for(&row.provider, &row.color_key);
 
             let cells: Vec<Cell> = if is_very_narrow {
@@ -673,7 +674,6 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                 vec![
                     Cell::from(format_message_time(row.timestamp, true))
                         .style(Style::default().fg(model_color)),
-                    Cell::from(truncate(dir, 12)).style(Style::default().fg(theme_muted)),
                     Cell::from(format_tokens(row.tokens.total())),
                     Cell::from(truncate(preview, 36)).style(Style::default().fg(theme_muted)),
                 ]
@@ -682,7 +682,6 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(format!("{}", idx + 1)).style(Style::default().fg(theme_muted)),
                     Cell::from(format_message_time(row.timestamp, false))
                         .style(Style::default().fg(model_color)),
-                    Cell::from(truncate(dir, 18)).style(Style::default().fg(theme_muted)),
                     Cell::from(format_tokens(row.tokens.input)).style(metric_input_style),
                     Cell::from(format_tokens(row.tokens.output)).style(metric_output_style),
                     Cell::from(format_tokens(row.tokens.cache_read)).style(metric_cache_read_style),
@@ -717,7 +716,6 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     } else if is_narrow {
         vec![
             Constraint::Length(6),
-            Constraint::Length(12),
             Constraint::Length(8),
             Constraint::Min(16),
         ]
@@ -725,7 +723,6 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         vec![
             Constraint::Length(3),
             Constraint::Length(8),
-            Constraint::Length(18),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(10),
@@ -993,10 +990,6 @@ fn joined_dirs(dirs: &[String]) -> String {
     } else {
         dirs.join(", ")
     }
-}
-
-fn message_dir<'a>(workspace_label: Option<&'a str>, workspace_key: Option<&'a str>) -> &'a str {
-    workspace_label.or(workspace_key).unwrap_or("\u{2014}")
 }
 
 fn format_message_time(timestamp_ms: i64, compact: bool) -> String {
