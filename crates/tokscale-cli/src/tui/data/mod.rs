@@ -47,6 +47,7 @@ impl TokenBreakdown {
 
 #[derive(Debug, Clone)]
 pub struct ModelUsage {
+    pub model_key: String,
     pub model: String,
     pub provider: String,
     pub client: String,
@@ -138,6 +139,7 @@ pub struct MessageUsage {
     pub timestamp: i64,
     pub source: String,
     pub provider: String,
+    pub model_group_key: String,
     pub model_key: String,
     pub model: String,
     pub color_key: String,
@@ -150,6 +152,8 @@ pub struct MessageUsage {
     pub cost: f64,
     pub message_count: u32,
     pub duration_ms: Option<i64>,
+    pub request_start_timestamp: Option<i64>,
+    pub request_end_timestamp: i64,
     pub is_turn_start: bool,
 }
 
@@ -284,6 +288,17 @@ fn aggregate_message_rows_by_request(mut rows: Vec<MessageUsage>) -> Vec<Message
     grouped
 }
 
+fn request_start_timestamp(timestamp: i64, duration_ms: Option<i64>) -> Option<i64> {
+    duration_ms
+        .filter(|duration| *duration > 0)
+        .map(|duration| timestamp.saturating_sub(duration))
+}
+
+fn request_wall_duration_ms(start_timestamp: Option<i64>, end_timestamp: i64) -> Option<i64> {
+    let duration = end_timestamp.saturating_sub(start_timestamp?);
+    (duration > 0).then_some(duration)
+}
+
 fn merge_message_row(target: &mut MessageUsage, row: MessageUsage) {
     target.tokens.input = target.tokens.input.saturating_add(row.tokens.input);
     target.tokens.output = target.tokens.output.saturating_add(row.tokens.output);
@@ -297,12 +312,28 @@ fn merge_message_row(target: &mut MessageUsage, row: MessageUsage) {
         target.cost += row.cost;
     }
     target.message_count = target.message_count.saturating_add(row.message_count);
-    target.duration_ms = match (target.duration_ms, row.duration_ms) {
+    let previous_duration = match (target.duration_ms, row.duration_ms) {
         (Some(left), Some(right)) => Some(left.max(right)),
         (Some(left), None) => Some(left),
         (None, Some(right)) => Some(right),
         (None, None) => None,
     };
+    target.request_start_timestamp = match (
+        target.request_start_timestamp,
+        row.request_start_timestamp,
+    ) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    };
+    target.request_end_timestamp = target
+        .request_end_timestamp
+        .max(row.request_end_timestamp)
+        .max(row.timestamp);
+    target.duration_ms =
+        request_wall_duration_ms(target.request_start_timestamp, target.request_end_timestamp)
+            .or(previous_duration);
     target.is_turn_start |= row.is_turn_start;
     if target.content_preview.is_none() {
         target.content_preview = row.content_preview;
@@ -380,6 +411,24 @@ fn hourly_model_display_name(group_by: &GroupBy, provider_id: &str, model: &str)
         | GroupBy::WorkspaceModel
         | GroupBy::Session
         | GroupBy::ClientSession => model.to_string(),
+    }
+}
+
+fn model_group_key(
+    group_by: &GroupBy,
+    client: &str,
+    provider_id: &str,
+    session_id: &str,
+    workspace_group_key: &str,
+    model: &str,
+) -> String {
+    match group_by {
+        GroupBy::Model => model.to_string(),
+        GroupBy::ClientModel => format!("{client}:{model}"),
+        GroupBy::ClientProviderModel => format!("{client}:{provider_id}:{model}"),
+        GroupBy::WorkspaceModel => format!("{workspace_group_key}:{model}"),
+        GroupBy::Session => format!("{session_id}:{model}"),
+        GroupBy::ClientSession => format!("{client}:{session_id}:{model}"),
     }
 }
 
@@ -532,23 +581,18 @@ impl DataLoader {
         for msg in &messages {
             let normalized_model = normalize_model_for_grouping(&msg.model_id);
             let (workspace_group_key, workspace_key, workspace_label) = workspace_bucket(msg);
-            let key = match group_by {
-                GroupBy::Model => normalized_model.clone(),
-                GroupBy::ClientModel => format!("{}:{}", msg.client, normalized_model),
-                GroupBy::ClientProviderModel => {
-                    format!("{}:{}:{}", msg.client, msg.provider_id, normalized_model)
-                }
-                GroupBy::WorkspaceModel => {
-                    format!("{}:{}", workspace_group_key, normalized_model)
-                }
-                GroupBy::Session => format!("{}:{}", msg.session_id, normalized_model),
-                GroupBy::ClientSession => {
-                    format!("{}:{}:{}", msg.client, msg.session_id, normalized_model)
-                }
-            };
+            let key = model_group_key(
+                group_by,
+                &msg.client,
+                &msg.provider_id,
+                &msg.session_id,
+                &workspace_group_key,
+                &normalized_model,
+            );
             let merge_clients = matches!(group_by, GroupBy::Model | GroupBy::WorkspaceModel);
 
             let model_entry = model_map.entry(key.clone()).or_insert_with(|| ModelUsage {
+                model_key: key.clone(),
                 model: normalized_model.clone(),
                 provider: msg.provider_id.clone(),
                 client: msg.client.clone(),
@@ -612,7 +656,7 @@ impl DataLoader {
                 .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
 
             let session_key = format!("{}:{}", msg.client, msg.session_id);
-            let model_sessions = model_session_ids.entry(key).or_default();
+            let model_sessions = model_session_ids.entry(key.clone()).or_default();
             if model_sessions.insert(session_key) {
                 model_entry.session_count += 1;
             }
@@ -791,11 +835,14 @@ impl DataLoader {
 
                 let message_tokens = positive_unified_token_breakdown(&msg.tokens);
                 if message_tokens.total() > 0 || msg_cost > 0.0 {
+                    let request_start_timestamp =
+                        request_start_timestamp(msg.timestamp, msg.duration_ms);
                     message_rows.push(MessageUsage {
                         date,
                         timestamp: msg.timestamp,
                         source: msg.client.clone(),
                         provider: msg.provider_id.clone(),
+                        model_group_key: key.clone(),
                         model_key: daily_message_model_key,
                         model: daily_message_display_name,
                         color_key: daily_message_color_key,
@@ -808,6 +855,8 @@ impl DataLoader {
                         cost: msg_cost,
                         message_count: msg.message_count.max(0) as u32,
                         duration_ms: msg.duration_ms,
+                        request_start_timestamp,
+                        request_end_timestamp: msg.timestamp,
                         is_turn_start: msg.is_turn_start,
                     });
                 }
@@ -2715,6 +2764,33 @@ after"#,
         assert_eq!(usage.messages[1].tokens.output, 3);
         assert_eq!(usage.messages[1].message_count, 2);
         assert!((usage.messages[1].cost - 0.30).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_aggregate_messages_uses_request_wall_duration_for_detail_rows() {
+        let loader = DataLoader::new(None);
+        let mut request_start = make_request_msg(
+            "session-1",
+            1_735_689_600_000,
+            10,
+            1,
+            0.10,
+            Some("request"),
+            true,
+        );
+        request_start.duration_ms = Some(2_000);
+        let mut request_tail =
+            make_request_msg("session-1", 1_735_689_610_000, 3, 2, 0.20, None, false);
+        request_tail.duration_ms = Some(1_000);
+
+        let usage = loader
+            .aggregate_messages(vec![request_start, request_tail], &GroupBy::Model)
+            .unwrap();
+
+        assert_eq!(usage.messages.len(), 1);
+        assert_eq!(usage.messages[0].request_start_timestamp, Some(1_735_689_598_000));
+        assert_eq!(usage.messages[0].request_end_timestamp, 1_735_689_610_000);
+        assert_eq!(usage.messages[0].duration_ms, Some(12_000));
     }
 
     #[test]

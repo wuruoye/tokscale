@@ -21,9 +21,9 @@ use super::data::{
 
 /// Cache staleness threshold: 5 minutes (matches TS implementation)
 const CACHE_STALE_THRESHOLD_MS: u64 = 5 * 60 * 1000;
-// 13: Codex fork replay parsing now keeps user-fork turns after repeated child
-// session_meta rows, so cached daily/session/request aggregates can be stale.
-const CACHE_SCHEMA_VERSION: u32 = 13;
+// 14: request detail rows now carry stable model grouping keys and request
+// start/end timestamps for wall-time duration aggregation.
+const CACHE_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,6 +131,8 @@ struct CachedTokenBreakdown {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CachedModelUsage {
+    #[serde(default)]
+    model_key: String,
     model: String,
     provider: String,
     client: String,
@@ -230,6 +232,8 @@ struct CachedMessageUsage {
     timestamp: i64,
     source: String,
     provider: String,
+    #[serde(default)]
+    model_group_key: String,
     model_key: String,
     model: String,
     color_key: String,
@@ -247,6 +251,10 @@ struct CachedMessageUsage {
     message_count: u32,
     #[serde(default)]
     duration_ms: Option<i64>,
+    #[serde(default)]
+    request_start_timestamp: Option<i64>,
+    #[serde(default)]
+    request_end_timestamp: i64,
     #[serde(default)]
     is_turn_start: bool,
 }
@@ -295,6 +303,7 @@ impl From<CachedTokenBreakdown> for TokenBreakdown {
 impl From<&ModelUsage> for CachedModelUsage {
     fn from(m: &ModelUsage) -> Self {
         Self {
+            model_key: m.model_key.clone(),
             model: m.model.clone(),
             provider: m.provider.clone(),
             client: m.client.clone(),
@@ -310,7 +319,13 @@ impl From<&ModelUsage> for CachedModelUsage {
 
 impl From<CachedModelUsage> for ModelUsage {
     fn from(m: CachedModelUsage) -> Self {
+        let model_key = if m.model_key.is_empty() {
+            m.model.clone()
+        } else {
+            m.model_key
+        };
         Self {
+            model_key,
             model: m.model,
             provider: m.provider,
             client: m.client,
@@ -503,6 +518,7 @@ impl From<&MessageUsage> for CachedMessageUsage {
             timestamp: m.timestamp,
             source: m.source.clone(),
             provider: m.provider.clone(),
+            model_group_key: m.model_group_key.clone(),
             model_key: m.model_key.clone(),
             model: m.model.clone(),
             color_key: m.color_key.clone(),
@@ -515,6 +531,8 @@ impl From<&MessageUsage> for CachedMessageUsage {
             cost: m.cost,
             message_count: m.message_count,
             duration_ms: m.duration_ms,
+            request_start_timestamp: m.request_start_timestamp,
+            request_end_timestamp: m.request_end_timestamp,
             is_turn_start: m.is_turn_start,
         }
     }
@@ -525,11 +543,23 @@ impl TryFrom<CachedMessageUsage> for MessageUsage {
 
     fn try_from(m: CachedMessageUsage) -> Result<Self, Self::Error> {
         use chrono::NaiveDate;
+        let model_group_key = if m.model_group_key.is_empty() {
+            m.model_key.clone()
+        } else {
+            m.model_group_key
+        };
+        let request_end_timestamp = if m.request_end_timestamp > 0 {
+            m.request_end_timestamp
+        } else {
+            m.timestamp
+        };
+
         Ok(Self {
             date: NaiveDate::parse_from_str(&m.date, "%Y-%m-%d")?,
             timestamp: m.timestamp,
             source: m.source,
             provider: m.provider,
+            model_group_key,
             model_key: m.model_key,
             model: m.model,
             color_key: m.color_key,
@@ -542,6 +572,8 @@ impl TryFrom<CachedMessageUsage> for MessageUsage {
             cost: m.cost,
             message_count: m.message_count,
             duration_ms: m.duration_ms,
+            request_start_timestamp: m.request_start_timestamp,
+            request_end_timestamp,
             is_turn_start: m.is_turn_start,
         })
     }

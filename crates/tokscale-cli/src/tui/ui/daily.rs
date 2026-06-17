@@ -605,8 +605,8 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         vec!["Time", "Tok", "Preview"]
     } else {
         vec![
-            "#", "Time", "Input", "Output", "Cache R", "Cache W", "Cachex", "Total", "Cost",
-            "Preview",
+            "#", "Time", "Input", "Output", "Cache R", "Cache W", "Cachex", "Total",
+            "Duration", "Cost", "Preview",
         ]
     };
 
@@ -630,7 +630,7 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                     (1, _, true) => sort_indicator(SortField::Tokens),
                     (1, true, false) => sort_indicator(SortField::Tokens),
                     (7, false, false) => sort_indicator(SortField::Tokens),
-                    (8, false, false) => sort_indicator(SortField::Cost),
+                    (9, false, false) => sort_indicator(SortField::Cost),
                     (1, false, false) => sort_indicator(SortField::Date),
                     (0, true, false) | (0, _, true) => sort_indicator(SortField::Date),
                     _ => "",
@@ -694,6 +694,8 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
                     ))
                     .style(Style::default().fg(Color::Cyan)),
                     Cell::from(format_tokens(row.tokens.total())),
+                    Cell::from(format_duration(row.duration_ms.unwrap_or(0)))
+                        .style(Style::default().fg(Color::Yellow)),
                     Cell::from(format_cost(row.cost)).style(Style::default().fg(Color::Green)),
                     Cell::from(truncate(preview, 64)).style(Style::default().fg(theme_muted)),
                 ]
@@ -729,6 +731,7 @@ fn render_request_detail(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(10),
             Constraint::Length(8),
             Constraint::Length(10),
+            Constraint::Length(9),
             Constraint::Length(10),
             Constraint::Min(24),
         ]
@@ -989,6 +992,20 @@ fn joined_dirs(dirs: &[String]) -> String {
         "\u{2014}".to_string()
     } else {
         dirs.join(", ")
+    }
+}
+
+fn format_duration(ms: i64) -> String {
+    if ms <= 0 {
+        return "\u{2014}".to_string();
+    }
+    let total_secs = ms / 1000;
+    if total_secs < 60 {
+        format!("{}s", total_secs)
+    } else {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{}m{}s", mins, secs)
     }
 }
 

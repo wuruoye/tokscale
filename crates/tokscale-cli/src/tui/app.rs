@@ -195,6 +195,36 @@ struct DailySessionDetailSelection {
     session_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelDetailSelection {
+    model_key: String,
+    model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelSessionDetailSelection {
+    model_key: String,
+    session_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelSessionRow {
+    pub provider: String,
+    pub color_key: String,
+    pub session_id: String,
+    pub dirs: Vec<String>,
+    pub agents: Vec<String>,
+    pub preview: Option<String>,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub requests: u64,
+    pub message_count: u64,
+    pub first_timestamp: i64,
+    pub last_timestamp: i64,
+    pub last_request_timestamp: i64,
+    pub duration_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 pub enum ClickAction {
     Tab(Tab),
@@ -265,6 +295,17 @@ pub struct App {
     daily_detail_scroll_offset: usize,
     daily_model_selected_index: usize,
     daily_model_scroll_offset: usize,
+
+    selected_model_detail: Option<ModelDetailSelection>,
+    selected_model_session_detail: Option<ModelSessionDetailSelection>,
+    model_list_selected_index: usize,
+    model_list_scroll_offset: usize,
+    model_session_selected_index: usize,
+    model_session_scroll_offset: usize,
+    model_list_saved_sort_field: Option<SortField>,
+    model_list_saved_sort_direction: Option<SortDirection>,
+    model_session_saved_sort_field: Option<SortField>,
+    model_session_saved_sort_direction: Option<SortDirection>,
 
     pub selected_graph_cell: Option<(usize, usize)>,
     pub stats_breakdown_total_lines: usize,
@@ -400,6 +441,16 @@ impl App {
             daily_detail_scroll_offset: 0,
             daily_model_selected_index: 0,
             daily_model_scroll_offset: 0,
+            selected_model_detail: None,
+            selected_model_session_detail: None,
+            model_list_selected_index: 0,
+            model_list_scroll_offset: 0,
+            model_session_selected_index: 0,
+            model_session_scroll_offset: 0,
+            model_list_saved_sort_field: None,
+            model_list_saved_sort_direction: None,
+            model_session_saved_sort_field: None,
+            model_session_saved_sort_direction: None,
             selected_graph_cell: None,
             stats_breakdown_total_lines: 0,
             auto_refresh,
@@ -490,6 +541,45 @@ impl App {
             self.selected_daily_session_detail = None;
             self.selected_index = self.daily_model_selected_index;
             self.scroll_offset = self.daily_model_scroll_offset;
+        }
+
+        // Exit Models-detail mode if the refresh dropped the model we were viewing
+        if self
+            .selected_model_detail
+            .as_ref()
+            .is_some_and(|selection| {
+                !self
+                    .data
+                    .models
+                    .iter()
+                    .any(|m| m.model_key == selection.model_key)
+            })
+        {
+            self.selected_model_session_detail = None;
+            self.selected_model_detail = None;
+            self.restore_model_session_sort();
+            self.restore_model_list_sort();
+            self.selected_index = self.model_list_selected_index;
+            self.scroll_offset = self.model_list_scroll_offset;
+        }
+        if self
+            .selected_model_session_detail
+            .as_ref()
+            .is_some_and(|selection| {
+                !self
+                    .data
+                    .messages
+                    .iter()
+                    .any(|m| {
+                        m.model_group_key == selection.model_key
+                            && m.session_id == selection.session_id
+                    })
+            })
+        {
+            self.selected_model_session_detail = None;
+            self.restore_model_session_sort();
+            self.selected_index = self.model_session_selected_index;
+            self.scroll_offset = self.model_session_scroll_offset;
         }
 
         self.clamp_selection();
@@ -768,6 +858,9 @@ impl App {
             KeyCode::Enter if self.current_tab == Tab::Daily => {
                 self.handle_daily_enter();
             }
+            KeyCode::Enter if self.current_tab == Tab::Models => {
+                self.handle_models_enter();
+            }
             KeyCode::Enter if self.current_tab == Tab::Stats => {
                 self.handle_graph_selection();
             }
@@ -785,6 +878,16 @@ impl App {
                 if self.current_tab == Tab::Daily && self.is_daily_detail_active() =>
             {
                 self.close_daily_detail();
+            }
+            KeyCode::Esc | KeyCode::Backspace
+                if self.current_tab == Tab::Models && self.is_model_session_detail_active() =>
+            {
+                self.close_model_session_detail();
+            }
+            KeyCode::Esc | KeyCode::Backspace
+                if self.current_tab == Tab::Models && self.is_model_detail_active() =>
+            {
+                self.close_model_detail();
             }
             KeyCode::Esc if self.selected_graph_cell.is_some() => {
                 self.selected_graph_cell = None;
@@ -1159,11 +1262,25 @@ impl App {
         self.daily_detail_scroll_offset = 0;
         self.daily_model_selected_index = 0;
         self.daily_model_scroll_offset = 0;
+        self.selected_model_detail = None;
+        self.selected_model_session_detail = None;
+        self.model_list_selected_index = 0;
+        self.model_list_scroll_offset = 0;
+        self.model_session_selected_index = 0;
+        self.model_session_scroll_offset = 0;
+        self.model_list_saved_sort_field = None;
+        self.model_list_saved_sort_direction = None;
+        self.model_session_saved_sort_field = None;
+        self.model_session_saved_sort_direction = None;
         self.selected_graph_cell = None;
         self.stats_breakdown_total_lines = 0;
     }
 
     fn switch_tab(&mut self, target: Tab) {
+        if self.current_tab == Tab::Models && self.is_model_detail_active() {
+            self.restore_model_session_sort();
+            self.restore_model_list_sort();
+        }
         self.persist_current_sort();
 
         self.current_tab = target;
@@ -1174,6 +1291,14 @@ impl App {
             self.selected_daily_detail_date = None;
             self.selected_daily_session_detail = None;
             self.selected_daily_model_detail = None;
+        }
+        if target != Tab::Models {
+            self.selected_model_detail = None;
+            self.selected_model_session_detail = None;
+            self.model_list_saved_sort_field = None;
+            self.model_list_saved_sort_direction = None;
+            self.model_session_saved_sort_field = None;
+            self.model_session_saved_sort_direction = None;
         }
 
         let (field, dir) = self
@@ -1223,6 +1348,31 @@ impl App {
     fn persist_current_sort(&mut self) {
         self.tab_sort_state
             .insert(self.current_tab, (self.sort_field, self.sort_direction));
+    }
+
+    fn restore_model_list_sort(&mut self) {
+        let mut restored = false;
+        if let Some(field) = self.model_list_saved_sort_field.take() {
+            self.sort_field = field;
+            restored = true;
+        }
+        if let Some(dir) = self.model_list_saved_sort_direction.take() {
+            self.sort_direction = dir;
+            restored = true;
+        }
+        if restored {
+            self.tab_sort_state
+                .insert(Tab::Models, (self.sort_field, self.sort_direction));
+        }
+    }
+
+    fn restore_model_session_sort(&mut self) {
+        if let Some(field) = self.model_session_saved_sort_field.take() {
+            self.sort_field = field;
+        }
+        if let Some(dir) = self.model_session_saved_sort_direction.take() {
+            self.sort_direction = dir;
+        }
     }
 
     fn move_selection_up(&mut self) {
@@ -1334,7 +1484,14 @@ impl App {
 
     fn get_current_list_len(&self) -> usize {
         match self.current_tab {
-            Tab::Overview | Tab::Models => self.data.models.len(),
+            Tab::Overview => self.data.models.len(),
+            Tab::Models if self.is_model_session_detail_active() => {
+                self.get_sorted_model_message_rows().len()
+            }
+            Tab::Models if self.is_model_detail_active() => {
+                self.get_sorted_model_session_rows().len()
+            }
+            Tab::Models => self.data.models.len(),
             Tab::Agents => self.data.agents.len(),
             Tab::Daily if self.is_daily_session_detail_active() => {
                 self.get_sorted_daily_message_rows().len()
@@ -1373,8 +1530,15 @@ impl App {
             self.sort_field = field;
             self.sort_direction = SortDirection::Descending;
         }
-        self.persist_current_sort();
+        let model_drilldown_active = self.current_tab == Tab::Models
+            && (self.is_model_detail_active() || self.is_model_session_detail_active());
+        if !model_drilldown_active {
+            self.persist_current_sort();
+        }
         if self.current_tab == Tab::Daily && self.is_daily_detail_active() {
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+        } else if model_drilldown_active {
             self.selected_index = 0;
             self.scroll_offset = 0;
         } else {
@@ -1648,6 +1812,133 @@ impl App {
         self.clamp_selection();
     }
 
+    fn handle_models_enter(&mut self) {
+        if self.is_model_session_detail_active() {
+            return;
+        }
+        if self.is_model_detail_active() {
+            self.open_selected_model_session_detail();
+        } else {
+            self.open_selected_model_detail();
+        }
+    }
+
+    fn open_selected_model_detail(&mut self) {
+        let selected = {
+            let models = self.get_sorted_models();
+            models.get(self.selected_index).map(|m| ModelDetailSelection {
+                model_key: m.model_key.clone(),
+                model: m.model.clone(),
+            })
+        };
+
+        if let Some(selection) = selected {
+            self.model_list_selected_index = self.selected_index;
+            self.model_list_scroll_offset = self.scroll_offset;
+            // Save sort and switch to Date/Descending for session list
+            self.model_list_saved_sort_field = Some(self.sort_field);
+            self.model_list_saved_sort_direction = Some(self.sort_direction);
+            self.sort_field = SortField::Date;
+            self.sort_direction = SortDirection::Descending;
+            self.selected_model_session_detail = None;
+            self.selected_model_detail = Some(selection.clone());
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            self.set_status(&format!("Viewing sessions for {}", selection.model));
+            self.clamp_selection();
+        }
+    }
+
+    fn open_selected_model_session_detail(&mut self) {
+        let selected = {
+            let rows = self.get_sorted_model_session_rows();
+            rows.get(self.selected_index)
+                .map(|row| ModelSessionDetailSelection {
+                    model_key: self
+                        .selected_model_detail
+                        .as_ref()
+                        .map(|s| s.model_key.clone())
+                        .unwrap_or_default(),
+                    session_id: row.session_id.clone(),
+                })
+        };
+
+        if let Some(selection) = selected {
+            self.model_session_selected_index = self.selected_index;
+            self.model_session_scroll_offset = self.scroll_offset;
+            self.model_session_saved_sort_field = Some(self.sort_field);
+            self.model_session_saved_sort_direction = Some(self.sort_direction);
+            // Ensure Date/Descending for request list
+            self.sort_field = SortField::Date;
+            self.sort_direction = SortDirection::Descending;
+            self.selected_model_session_detail = Some(selection.clone());
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            self.set_status(&format!("Viewing requests for {}", selection.session_id));
+            self.clamp_selection();
+        }
+    }
+
+    fn close_model_session_detail(&mut self) {
+        let Some(selection) = self.selected_model_session_detail.take() else {
+            return;
+        };
+
+        self.restore_model_session_sort();
+
+        let restored_index = self
+            .get_sorted_model_session_rows()
+            .iter()
+            .position(|row| row.session_id == selection.session_id)
+            .unwrap_or(self.model_session_selected_index);
+
+        self.selected_index = restored_index;
+
+        let max_visible = self.max_visible_items.max(1);
+        let viewport_still_holds = restored_index >= self.model_session_scroll_offset
+            && restored_index < self.model_session_scroll_offset + max_visible;
+        self.scroll_offset = if viewport_still_holds {
+            self.model_session_scroll_offset
+        } else {
+            restored_index.saturating_sub(max_visible / 2)
+        };
+
+        self.set_status("Returned to model session details");
+        self.clamp_selection();
+    }
+
+    fn close_model_detail(&mut self) {
+        let Some(selection) = self.selected_model_detail.take() else {
+            return;
+        };
+
+        self.selected_model_session_detail = None;
+
+        // Restore sort that was active before entering the drilldown
+        self.restore_model_session_sort();
+        self.restore_model_list_sort();
+
+        let restored_index = self
+            .get_sorted_models()
+            .iter()
+            .position(|m| m.model_key == selection.model_key)
+            .unwrap_or(self.model_list_selected_index);
+
+        self.selected_index = restored_index;
+
+        let max_visible = self.max_visible_items.max(1);
+        let viewport_still_holds = restored_index >= self.model_list_scroll_offset
+            && restored_index < self.model_list_scroll_offset + max_visible;
+        self.scroll_offset = if viewport_still_holds {
+            self.model_list_scroll_offset
+        } else {
+            restored_index.saturating_sub(max_visible / 2)
+        };
+
+        self.set_status("Returned to models");
+        self.clamp_selection();
+    }
+
     fn toggle_auto_refresh(&mut self) {
         self.auto_refresh = !self.auto_refresh;
         self.settings.auto_refresh_enabled = self.auto_refresh;
@@ -1697,7 +1988,36 @@ impl App {
 
     fn copy_selected_to_clipboard(&mut self) {
         let text = match self.current_tab {
-            Tab::Overview | Tab::Models => self
+            Tab::Overview => self
+                .get_sorted_models()
+                .get(self.selected_index)
+                .map(|m| format!("{}: {} tokens, ${:.4}", m.model, m.tokens.total(), m.cost)),
+            Tab::Models if self.is_model_session_detail_active() => self
+                .get_sorted_model_message_rows()
+                .get(self.selected_index)
+                .map(|row| {
+                    format!(
+                        "{} / {} / {}: {} tokens, ${:.4}",
+                        row.source,
+                        row.model,
+                        row.session_id,
+                        row.tokens.total(),
+                        row.cost
+                    )
+                }),
+            Tab::Models if self.is_model_detail_active() => self
+                .get_sorted_model_session_rows()
+                .get(self.selected_index)
+                .map(|row| {
+                    format!(
+                        "{}: {} requests, {} tokens, ${:.4}",
+                        row.session_id,
+                        row.requests,
+                        row.tokens.total(),
+                        row.cost
+                    )
+                }),
+            Tab::Models => self
                 .get_sorted_models()
                 .get(self.selected_index)
                 .map(|m| format!("{}: {} tokens, ${:.4}", m.model, m.tokens.total(), m.cost)),
@@ -1920,6 +2240,46 @@ impl App {
 
     pub fn is_daily_session_detail_active(&self) -> bool {
         self.selected_daily_session_detail.is_some()
+    }
+
+    pub fn is_model_detail_active(&self) -> bool {
+        self.selected_model_detail.is_some()
+    }
+
+    pub fn is_model_session_detail_active(&self) -> bool {
+        self.selected_model_session_detail.is_some()
+    }
+
+    pub fn model_detail_model_name(&self) -> Option<&str> {
+        self.selected_model_detail
+            .as_ref()
+            .map(|selection| selection.model.as_str())
+    }
+
+    pub fn model_session_dir_title(&self) -> Option<String> {
+        let selection = self.selected_model_session_detail.as_ref()?;
+        let dirs: BTreeSet<String> = self
+            .data
+            .messages
+            .iter()
+            .filter(|message| {
+                message.model_group_key == selection.model_key
+                    && message.session_id == selection.session_id
+            })
+            .filter_map(|message| {
+                message
+                    .workspace_label
+                    .as_ref()
+                    .or(message.workspace_key.as_ref())
+                    .cloned()
+            })
+            .collect();
+
+        if dirs.is_empty() {
+            None
+        } else {
+            Some(dirs.into_iter().collect::<Vec<_>>().join(", "))
+        }
     }
 
     pub fn daily_detail_date(&self) -> Option<NaiveDate> {
@@ -2238,6 +2598,193 @@ impl App {
                     .cmp(&b.timestamp)
                     .then_with(|| a.session_id.cmp(&b.session_id))
             }),
+        }
+
+        rows
+    }
+
+    pub fn get_sorted_model_session_rows(&self) -> Vec<ModelSessionRow> {
+        let Some(selection) = self.selected_model_detail.as_ref() else {
+            return Vec::new();
+        };
+
+        let model_key = &selection.model_key;
+        let mut session_map: HashMap<String, ModelSessionRow> = HashMap::new();
+        let mut preview_timestamp_by_session: HashMap<String, i64> = HashMap::new();
+
+        for msg in &self.data.messages {
+            if msg.model_group_key != *model_key {
+                continue;
+            }
+
+            let entry = session_map
+                .entry(msg.session_id.clone())
+                .or_insert_with(|| ModelSessionRow {
+                    provider: msg.provider.clone(),
+                    color_key: msg.color_key.clone(),
+                    session_id: msg.session_id.clone(),
+                    dirs: Vec::new(),
+                    agents: Vec::new(),
+                    preview: None,
+                    tokens: TokenBreakdown::default(),
+                    cost: 0.0,
+                    requests: 0,
+                    message_count: 0,
+                    first_timestamp: msg.timestamp,
+                    last_timestamp: msg.timestamp,
+                    last_request_timestamp: 0,
+                    duration_ms: 0,
+                });
+
+            // Collect unique directories
+            if let Some(ref dir) = msg.workspace_label {
+                if !entry.dirs.contains(dir) {
+                    entry.dirs.push(dir.clone());
+                }
+            } else if let Some(ref key) = msg.workspace_key {
+                if !entry.dirs.contains(key) {
+                    entry.dirs.push(key.clone());
+                }
+            }
+
+            // Collect unique agents
+            if let Some(ref agent) = msg.agent {
+                if !entry.agents.contains(agent) {
+                    entry.agents.push(agent.clone());
+                }
+            }
+
+            // Capture preview of the earliest request (by request timestamp)
+            if let Some(preview) = msg.content_preview.as_ref() {
+                let should_replace = preview_timestamp_by_session
+                    .get(&msg.session_id)
+                    .is_none_or(|timestamp| msg.timestamp < *timestamp);
+                if should_replace {
+                    preview_timestamp_by_session.insert(msg.session_id.clone(), msg.timestamp);
+                    entry.preview = Some(preview.clone());
+                }
+            }
+
+            // Aggregate tokens
+            entry.tokens.input = entry.tokens.input.saturating_add(msg.tokens.input.max(0) as u64);
+            entry.tokens.output =
+                entry.tokens.output.saturating_add(msg.tokens.output.max(0) as u64);
+            entry.tokens.cache_read =
+                entry.tokens.cache_read.saturating_add(msg.tokens.cache_read.max(0) as u64);
+            entry.tokens.cache_write = entry
+                .tokens
+                .cache_write
+                .saturating_add(msg.tokens.cache_write.max(0) as u64);
+            entry.tokens.reasoning =
+                entry.tokens.reasoning.saturating_add(msg.tokens.reasoning.max(0) as u64);
+
+            let msg_cost = if msg.cost.is_finite() && msg.cost >= 0.0 {
+                msg.cost
+            } else {
+                0.0
+            };
+            entry.cost += msg_cost;
+
+            // Count requests (messages with content_preview are request starts)
+            if msg.content_preview.is_some() {
+                entry.requests = entry.requests.saturating_add(1);
+                // Track latest request timestamp (for sorting & display)
+                if msg.timestamp > entry.last_request_timestamp {
+                    entry.last_request_timestamp = msg.timestamp;
+                }
+            }
+            entry.message_count = entry.message_count.saturating_add(msg.message_count.max(0) as u64);
+
+            // Track timestamp range
+            if msg.timestamp < entry.first_timestamp {
+                entry.first_timestamp = msg.timestamp;
+            }
+            if msg.timestamp > entry.last_timestamp {
+                entry.last_timestamp = msg.timestamp;
+            }
+        }
+
+        let mut rows: Vec<ModelSessionRow> = session_map.into_values().collect();
+        // Compute duration_ms from request timestamps, fall back to message timestamps
+        for row in &mut rows {
+            let start = row.first_timestamp.max(0);
+            let end = if row.last_request_timestamp > 0 {
+                row.last_request_timestamp
+            } else {
+                row.last_timestamp
+            };
+            row.duration_ms = (end - start).max(0);
+        }
+        // Sort: Date (last_request_timestamp) descending by default, or respect current sort field
+        let sort_ts = |r: &ModelSessionRow| {
+            if r.last_request_timestamp > 0 { r.last_request_timestamp } else { r.last_timestamp }
+        };
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Ascending) => {
+                rows.sort_by(|a, b| a.cost.total_cmp(&b.cost).then_with(|| a.session_id.cmp(&b.session_id)))
+            }
+            (SortField::Cost, SortDirection::Descending) => {
+                rows.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| a.session_id.cmp(&b.session_id)))
+            }
+            (SortField::Tokens, SortDirection::Ascending) => rows.sort_by(|a, b| {
+                a.tokens.total().cmp(&b.tokens.total()).then_with(|| a.session_id.cmp(&b.session_id))
+            }),
+            (SortField::Tokens, SortDirection::Descending) => rows.sort_by(|a, b| {
+                b.tokens.total().cmp(&a.tokens.total()).then_with(|| a.session_id.cmp(&b.session_id))
+            }),
+            (SortField::Date, SortDirection::Ascending) => rows.sort_by(|a, b| {
+                sort_ts(a).cmp(&sort_ts(b)).then_with(|| a.session_id.cmp(&b.session_id))
+            }),
+            // Default: Date Descending (newest requests first)
+            _ => rows.sort_by(|a, b| {
+                sort_ts(b).cmp(&sort_ts(a)).then_with(|| a.session_id.cmp(&b.session_id))
+            }),
+        }
+        rows
+    }
+
+    pub fn get_sorted_model_message_rows(&self) -> Vec<&super::data::MessageUsage> {
+        let Some(selection) = self.selected_model_session_detail.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut rows: Vec<&super::data::MessageUsage> = self
+            .data
+            .messages
+            .iter()
+            .filter(|msg| {
+                msg.model_group_key == selection.model_key
+                    && msg.session_id == selection.session_id
+                    && msg.content_preview.is_some()
+            })
+            .collect();
+
+        // Sort by timestamp descending
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => {
+                rows.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| b.timestamp.cmp(&a.timestamp)))
+            }
+            (SortField::Cost, SortDirection::Ascending) => {
+                rows.sort_by(|a, b| a.cost.total_cmp(&b.cost).then_with(|| b.timestamp.cmp(&a.timestamp)))
+            }
+            (SortField::Tokens, SortDirection::Descending) => rows.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| b.timestamp.cmp(&a.timestamp))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => rows.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| b.timestamp.cmp(&a.timestamp))
+            }),
+            (SortField::Date, SortDirection::Descending) => {
+                rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.session_id.cmp(&b.session_id)))
+            }
+            (SortField::Date, SortDirection::Ascending) => {
+                rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.session_id.cmp(&b.session_id)))
+            }
         }
 
         rows
@@ -2684,6 +3231,7 @@ mod tests {
         // Add some mock data
         app.data.models = vec![
             ModelUsage {
+                model_key: "model1".to_string(),
                 model: "model1".to_string(),
                 provider: "provider1".to_string(),
                 client: "opencode".to_string(),
@@ -2695,6 +3243,7 @@ mod tests {
                 workspace_label: None,
             },
             ModelUsage {
+                model_key: "model2".to_string(),
                 model: "model2".to_string(),
                 provider: "provider2".to_string(),
                 client: "opencode".to_string(),
@@ -2733,6 +3282,7 @@ mod tests {
         // Add some mock data
         app.data.models = vec![
             ModelUsage {
+                model_key: "model1".to_string(),
                 model: "model1".to_string(),
                 provider: "provider1".to_string(),
                 client: "opencode".to_string(),
@@ -2744,6 +3294,7 @@ mod tests {
                 workspace_label: None,
             },
             ModelUsage {
+                model_key: "model2".to_string(),
                 model: "model2".to_string(),
                 provider: "provider2".to_string(),
                 client: "opencode".to_string(),
@@ -2781,6 +3332,7 @@ mod tests {
 
         // Add some mock data
         app.data.models = vec![ModelUsage {
+            model_key: "model1".to_string(),
             model: "model1".to_string(),
             provider: "provider1".to_string(),
             client: "opencode".to_string(),
@@ -2897,6 +3449,7 @@ mod tests {
         let mut app = make_app();
         app.data.models = (0..n)
             .map(|i| ModelUsage {
+                model_key: format!("model{}", i),
                 model: format!("model{}", i),
                 provider: "provider".to_string(),
                 client: "opencode".to_string(),
@@ -2972,11 +3525,38 @@ mod tests {
         input_tokens: u64,
         preview: Option<&str>,
     ) -> MessageUsage {
+        message_usage_for_group(
+            date,
+            source,
+            "anthropic",
+            model_key,
+            model_key,
+            model,
+            session_id,
+            timestamp,
+            input_tokens,
+            preview,
+        )
+    }
+
+    fn message_usage_for_group(
+        date: &str,
+        source: &str,
+        provider: &str,
+        model_group_key: &str,
+        model_key: &str,
+        model: &str,
+        session_id: &str,
+        timestamp: i64,
+        input_tokens: u64,
+        preview: Option<&str>,
+    ) -> MessageUsage {
         MessageUsage {
             date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
             timestamp,
             source: source.to_string(),
-            provider: "anthropic".to_string(),
+            provider: provider.to_string(),
+            model_group_key: model_group_key.to_string(),
             model_key: model_key.to_string(),
             model: model.to_string(),
             color_key: model.to_string(),
@@ -2995,7 +3575,30 @@ mod tests {
             cost: 0.01,
             message_count: 1,
             duration_ms: None,
+            request_start_timestamp: None,
+            request_end_timestamp: timestamp,
             is_turn_start: true,
+        }
+    }
+
+    fn model_usage_for_group(
+        model_key: &str,
+        model: &str,
+        provider: &str,
+        client: &str,
+        cost: f64,
+    ) -> ModelUsage {
+        ModelUsage {
+            model_key: model_key.to_string(),
+            model: model.to_string(),
+            provider: provider.to_string(),
+            client: client.to_string(),
+            workspace_key: None,
+            workspace_label: None,
+            tokens: TokenBreakdown::default(),
+            cost,
+            performance: Default::default(),
+            session_count: 1,
         }
     }
 
@@ -3589,6 +4192,148 @@ mod tests {
     }
 
     // ── handle_key_event: sort ──────────────────────────────────────
+
+    #[test]
+    fn test_model_drilldown_filters_by_stable_group_key() {
+        let mut app = make_app();
+        app.current_tab = Tab::Models;
+        *app.group_by.borrow_mut() = tokscale_core::GroupBy::ClientProviderModel;
+        app.data.models = vec![
+            model_usage_for_group(
+                "claude:anthropic:shared-model",
+                "shared-model",
+                "anthropic",
+                "claude",
+                1.0,
+            ),
+            model_usage_for_group(
+                "opencode:openrouter:shared-model",
+                "shared-model",
+                "openrouter",
+                "opencode",
+                2.0,
+            ),
+        ];
+        app.data.messages = vec![
+            message_usage_for_group(
+                "2026-05-18",
+                "claude",
+                "anthropic",
+                "claude:anthropic:shared-model",
+                "anthropic:shared-model",
+                "shared-model",
+                "claude-session",
+                1_779_000_001_000,
+                10,
+                Some("claude request"),
+            ),
+            message_usage_for_group(
+                "2026-05-18",
+                "opencode",
+                "openrouter",
+                "opencode:openrouter:shared-model",
+                "openrouter:shared-model",
+                "shared-model",
+                "opencode-session",
+                1_779_000_002_000,
+                20,
+                Some("opencode request"),
+            ),
+        ];
+
+        app.selected_index = 0;
+        assert_eq!(
+            app.get_sorted_models()[app.selected_index].model_key.as_str(),
+            "opencode:openrouter:shared-model"
+        );
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_model_detail_active());
+        let sessions = app.get_sorted_model_session_rows();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id.as_str(), "opencode-session");
+        assert_eq!(sessions[0].provider.as_str(), "openrouter");
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_model_session_detail_active());
+        let requests = app.get_sorted_model_message_rows();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].session_id.as_str(), "opencode-session");
+        assert_eq!(
+            requests[0].content_preview.as_deref(),
+            Some("opencode request")
+        );
+    }
+
+    #[test]
+    fn test_model_drilldown_sort_restores_model_tab_sort() {
+        let mut app = make_app();
+        app.current_tab = Tab::Models;
+        app.data.models = vec![
+            model_usage_for_group("cheap-model", "cheap-model", "anthropic", "claude", 1.0),
+            model_usage_for_group(
+                "expensive-model",
+                "expensive-model",
+                "anthropic",
+                "claude",
+                2.0,
+            ),
+        ];
+        app.data.messages = vec![message_usage_for_group(
+            "2026-05-18",
+            "claude",
+            "anthropic",
+            "expensive-model",
+            "anthropic:expensive-model",
+            "expensive-model",
+            "session-expensive",
+            1_779_000_002_000,
+            20,
+            Some("selected request"),
+        )];
+
+        assert_eq!(app.sort_field, SortField::Cost);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+        assert_eq!(
+            app.get_sorted_models()[app.selected_index].model_key.as_str(),
+            "expensive-model"
+        );
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_model_detail_active());
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_model_session_detail_active());
+        app.handle_key_event(key(KeyCode::Char('c')));
+        assert_eq!(app.sort_field, SortField::Cost);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(app.is_model_detail_active());
+        assert!(!app.is_model_session_detail_active());
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.is_model_detail_active());
+        assert_eq!(app.sort_field, SortField::Cost);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+        assert_eq!(
+            app.tab_sort_state.get(&Tab::Models),
+            Some(&(SortField::Cost, SortDirection::Descending))
+        );
+        assert_eq!(
+            app.get_sorted_models()[app.selected_index].model_key.as_str(),
+            "expensive-model"
+        );
+
+        app.switch_tab(Tab::Daily);
+        app.switch_tab(Tab::Models);
+        assert_eq!(app.sort_field, SortField::Cost);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+    }
 
     #[test]
     fn test_handle_key_sort_cost() {
@@ -4431,6 +5176,7 @@ mod tests {
 
     fn model_usage(name: &str, cost: f64, workspace: Option<&str>) -> ModelUsage {
         ModelUsage {
+            model_key: name.to_string(),
             model: name.to_string(),
             provider: "anthropic".to_string(),
             client: "claude".to_string(),
@@ -4581,6 +5327,7 @@ mod tests {
         let mut app = make_app();
         app.data.models = vec![
             ModelUsage {
+                model_key: "claude-opus-4-5".to_string(),
                 model: "claude-opus-4-5".to_string(),
                 provider: "anthropic".to_string(),
                 client: "claude".to_string(),
@@ -4592,6 +5339,7 @@ mod tests {
                 session_count: 1,
             },
             ModelUsage {
+                model_key: "gpt-5".to_string(),
                 model: "gpt-5".to_string(),
                 provider: "openai".to_string(),
                 client: "codex".to_string(),
@@ -4648,6 +5396,7 @@ mod tests {
         let mut app = make_app();
         app.data.models = vec![
             ModelUsage {
+                model_key: "sonnet-shared".to_string(),
                 model: "sonnet-shared".to_string(),
                 provider: "anthropic".to_string(),
                 client: "claude".to_string(),
@@ -4659,6 +5408,7 @@ mod tests {
                 session_count: 1,
             },
             ModelUsage {
+                model_key: "sonnet-shared".to_string(),
                 model: "sonnet-shared".to_string(),
                 provider: "openai".to_string(),
                 client: "codex".to_string(),
