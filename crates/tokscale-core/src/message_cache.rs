@@ -12,6 +12,8 @@ use std::time::UNIX_EPOCH;
 
 // 19: cached UnifiedMessage entries now include content_preview. The cache is
 // bincode-backed, so adding a serialized struct field requires a schema bump.
+// It also invalidates older Codex fork parses that can miss user-fork turns
+// after repeated child session_meta rows.
 const CACHE_SCHEMA_VERSION: u32 = 19;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";

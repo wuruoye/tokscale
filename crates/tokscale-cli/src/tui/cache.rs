@@ -21,7 +21,9 @@ use super::data::{
 
 /// Cache staleness threshold: 5 minutes (matches TS implementation)
 const CACHE_STALE_THRESHOLD_MS: u64 = 5 * 60 * 1000;
-const CACHE_SCHEMA_VERSION: u32 = 12;
+// 13: Codex fork replay parsing now keeps user-fork turns after repeated child
+// session_meta rows, so cached daily/session/request aggregates can be stale.
+const CACHE_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1202,7 +1204,7 @@ mod tests {
         fs::write(
             &cache_path,
             r#"{
-  "schemaVersion": 12,
+  "schemaVersion": 13,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,
@@ -1525,7 +1527,7 @@ mod tests {
         fs::write(
             &cache_path,
             r#"{
-  "schemaVersion": 12,
+  "schemaVersion": 13,
   "timestamp": 9999999999999,
   "enabledClients": ["claude", "cursor"],
   "includeSynthetic": false,
@@ -1807,7 +1809,7 @@ mod tests {
         fs::write(
             &legacy_path,
             r#"{
-  "schemaVersion": 12,
+  "schemaVersion": 13,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,
