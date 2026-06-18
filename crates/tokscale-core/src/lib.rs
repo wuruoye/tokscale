@@ -3,6 +3,7 @@
 mod aggregator;
 mod cc_mirror;
 pub mod clients;
+pub mod content_extractor;
 pub mod fs_atomic;
 pub mod mcp;
 mod message_cache;
@@ -13,6 +14,7 @@ mod provider_identity;
 pub mod scanner;
 pub mod sessionize;
 pub mod sessions;
+pub mod wiki;
 
 pub use aggregator::*;
 pub use clients::{ClientCounts, ClientDef, ClientId, PathRoot};
@@ -893,6 +895,30 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    // Parse MiMo Code: SQLite database(s)
+    let mut micode_seen: HashSet<String> = HashSet::new();
+
+    for db_path in &scan_result.micode_dbs {
+        let CachedParseOutcome {
+            messages,
+            cache_entry,
+            ..
+        } = load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
+            sessions::micode::parse_micode_sqlite(path)
+        });
+
+        all_messages.extend(messages.into_iter().filter(|message| {
+            message
+                .dedup_key
+                .as_ref()
+                .is_none_or(|key| micode_seen.insert(key.clone()))
+        }));
+
+        if let Some(entry) = cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let claude_home = PathBuf::from(home_dir);
     let claude_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Claude)
@@ -1046,6 +1072,32 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let jcode_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Jcode)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_jcode_path,
+                sessions::jcode::parse_jcode_file,
+            )
+        })
+        .collect();
+    let mut jcode_seen: HashSet<String> = HashSet::new();
+    for outcome in jcode_outcomes {
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut jcode_seen, message)),
+        );
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let amp_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Amp)
         .par_iter()
@@ -1125,6 +1177,27 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             source_cache.insert(entry);
         }
     }
+
+    // Command Code does not persist token usage or cost locally, so tokens are
+    // estimated and priced. The model id comes from ~/.commandcode/config.json
+    // (canonicalized, e.g. "MiniMaxAI/MiniMax-M3-Free" -> "MiniMax-M3"), not the
+    // transcript, so the source cache — which fingerprints only the transcript
+    // file — is bypassed: otherwise a config.json model change would leave stale
+    // cached pricing until the transcript itself changed.
+    let commandcode_messages: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::CommandCode)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::commandcode::parse_commandcode_file(path)
+                .into_iter()
+                .map(|mut msg| {
+                    apply_pricing_if_available(&mut msg, pricing);
+                    msg
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    all_messages.extend(commandcode_messages);
 
     // gjc (gajae-code) JSONL sessions. Binding note N1: this cached cluster
     // MUST obtain messages via the non-repricing parser and apply the A1
@@ -1354,6 +1427,21 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         })
         .collect();
     all_messages.extend(antigravity_messages);
+
+    let antigravity_cli_messages: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::AntigravityCli)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::antigravity_cli::parse_antigravity_cli_file(path)
+                .into_iter()
+                .map(|mut msg| {
+                    apply_pricing_if_available(&mut msg, pricing);
+                    msg
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    all_messages.extend(antigravity_cli_messages);
 
     // Trae API dump uses exact dollar_float totals, so pricing lookup is not needed.
     let trae_messages: Vec<UnifiedMessage> = scan_result
@@ -2308,6 +2396,20 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Pi, pi_count);
     messages.extend(pi_msgs);
 
+    let commandcode_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::CommandCode)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::commandcode::parse_commandcode_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let commandcode_count = commandcode_msgs.len() as i32;
+    counts.set(ClientId::CommandCode, commandcode_count);
+    messages.extend(commandcode_msgs);
+
     // gjc (gajae-code) JSONL sessions. This non-cached path produces
     // ParsedMessage (no cost field) and has no pricing service in scope, so
     // the A1 cost guard is a no-op here — cost correctness is enforced on the
@@ -2524,6 +2626,20 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Antigravity, antigravity_count);
     messages.extend(antigravity_msgs);
 
+    let antigravity_cli_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::AntigravityCli)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::antigravity_cli::parse_antigravity_cli_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let antigravity_cli_count = antigravity_cli_msgs.len() as i32;
+    counts.set(ClientId::AntigravityCli, antigravity_cli_count);
+    messages.extend(antigravity_cli_msgs);
+
     let trae_msgs: Vec<ParsedMessage> = {
         let unique_trae_messages = dedupe_latest_trae_messages(
             scan_result
@@ -2568,6 +2684,21 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let grok_count = summed_parsed_message_count(&grok_msgs);
     counts.set(ClientId::Grok, grok_count);
     messages.extend(grok_msgs);
+
+    let jcode_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Jcode)
+        .par_iter()
+        .flat_map(|path| sessions::jcode::parse_jcode_file(path))
+        .collect();
+    let mut jcode_seen: HashSet<String> = HashSet::new();
+    let jcode_msgs: Vec<ParsedMessage> = jcode_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut jcode_seen, message))
+        .map(|msg| unified_to_parsed(&msg))
+        .collect();
+    let jcode_count = summed_parsed_message_count(&jcode_msgs);
+    counts.set(ClientId::Jcode, jcode_count);
+    messages.extend(jcode_msgs);
 
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
@@ -4430,11 +4561,13 @@ mod tests {
                 .iter()
                 .map(|message| message.session_id.as_str())
                 .collect();
-            assert!(session_ids.contains(
-                "rollout-2026-01-02T03-10-00-22222222-2222-7222-8222-222222222222"
-            ));
+            assert!(session_ids
+                .contains("rollout-2026-01-02T03-10-00-22222222-2222-7222-8222-222222222222"));
             assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 1000);
-            assert_eq!(messages.iter().map(|m| m.tokens.cache_read).sum::<i64>(), 500);
+            assert_eq!(
+                messages.iter().map(|m| m.tokens.cache_read).sum::<i64>(),
+                500
+            );
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 150);
         }
 
