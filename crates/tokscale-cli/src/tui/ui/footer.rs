@@ -111,10 +111,11 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
+    let totals = current_totals(app);
+
     // Total tokens
-    let total_tokens = app.data.total_tokens;
     right_spans.push(Span::styled(
-        format_tokens(total_tokens),
+        format_tokens(totals.tokens),
         Style::default().fg(Color::Cyan),
     ));
     if !is_very_narrow {
@@ -128,7 +129,7 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Total cost
     right_spans.push(Span::styled(
-        format_cost(app.data.total_cost),
+        format_cost(totals.cost),
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
@@ -148,8 +149,73 @@ fn render_main_row(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(right_para, chunks[1]);
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ViewTotals {
+    tokens: u64,
+    cost: f64,
+}
+
+impl ViewTotals {
+    fn add(&mut self, tokens: u64, cost: f64) {
+        self.tokens = self.tokens.saturating_add(tokens);
+        if cost.is_finite() && cost >= 0.0 {
+            self.cost += cost;
+        }
+    }
+}
+
+fn current_totals(app: &App) -> ViewTotals {
+    match app.current_tab {
+        Tab::Models if app.is_model_session_detail_active() => {
+            let mut totals = ViewTotals::default();
+            for row in app.get_sorted_model_message_rows() {
+                totals.add(row.tokens.total(), row.cost);
+            }
+            totals
+        }
+        Tab::Models if app.is_model_detail_active() => {
+            let mut totals = ViewTotals::default();
+            for row in app.get_sorted_model_session_rows() {
+                totals.add(row.tokens.total(), row.cost);
+            }
+            totals
+        }
+        Tab::Daily if app.is_daily_session_detail_active() => {
+            let mut totals = ViewTotals::default();
+            for row in app.get_sorted_daily_message_rows() {
+                totals.add(row.tokens.total(), row.cost);
+            }
+            totals
+        }
+        Tab::Daily if app.is_daily_model_detail_active() => {
+            let mut totals = ViewTotals::default();
+            for row in app.get_sorted_daily_session_rows() {
+                totals.add(row.tokens.total(), row.cost);
+            }
+            totals
+        }
+        Tab::Daily if app.is_daily_detail_active() => {
+            let mut totals = ViewTotals::default();
+            for row in app.get_sorted_daily_detail_rows() {
+                totals.add(row.tokens.total(), row.cost);
+            }
+            totals
+        }
+        _ => ViewTotals {
+            tokens: app.data.total_tokens,
+            cost: app.data.total_cost,
+        },
+    }
+}
+
 fn current_count_label(app: &App) -> String {
     match app.current_tab {
+        Tab::Models if app.is_model_session_detail_active() => {
+            format!(" ({} requests)", app.get_sorted_model_message_rows().len())
+        }
+        Tab::Models if app.is_model_detail_active() => {
+            format!(" ({} sessions)", app.get_sorted_model_session_rows().len())
+        }
         Tab::Overview | Tab::Models => format!(" ({} models)", app.data.models.len()),
         Tab::Agents => format!(" ({} agents)", app.data.agents.len()),
         Tab::Daily if app.is_daily_session_detail_active() => {
@@ -412,7 +478,13 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use crate::tui::app::TuiConfig;
-    use crate::tui::data::UsageData;
+    use crate::tui::data::{
+        DailyModelInfo, DailySourceInfo, DailyUsage, MessageUsage, ModelUsage, TokenBreakdown,
+        UsageData,
+    };
+    use chrono::NaiveDate;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::BTreeMap;
 
     fn make_app_on(tab: Tab) -> App {
         let config = TuiConfig {
@@ -426,6 +498,128 @@ mod tests {
             initial_tab: Some(tab),
         };
         App::new_with_cached_data(config, Some(UsageData::default())).unwrap()
+    }
+
+    fn make_app_on_with_data(tab: Tab, data: UsageData) -> App {
+        let config = TuiConfig {
+            theme: "blue".to_string(),
+            refresh: 0,
+            sessions_path: None,
+            clients: None,
+            since: None,
+            until: None,
+            year: None,
+            initial_tab: Some(tab),
+        };
+        App::new_with_cached_data(config, Some(data)).unwrap()
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn tokens(input: u64) -> TokenBreakdown {
+        TokenBreakdown {
+            input,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        }
+    }
+
+    fn model_usage(model_key: &str, model: &str, cost: f64, input_tokens: u64) -> ModelUsage {
+        ModelUsage {
+            model_key: model_key.to_string(),
+            model: model.to_string(),
+            provider: "anthropic".to_string(),
+            client: "claude".to_string(),
+            workspace_key: None,
+            workspace_label: None,
+            tokens: tokens(input_tokens),
+            cost,
+            performance: Default::default(),
+            session_count: 1,
+        }
+    }
+
+    fn message_usage(
+        date: &str,
+        model_key: &str,
+        session_id: &str,
+        timestamp: i64,
+        input_tokens: u64,
+        cost: f64,
+    ) -> MessageUsage {
+        MessageUsage {
+            date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            timestamp,
+            source: "claude".to_string(),
+            provider: "anthropic".to_string(),
+            model_group_key: model_key.to_string(),
+            model_key: model_key.to_string(),
+            model: model_key.to_string(),
+            color_key: model_key.to_string(),
+            session_id: session_id.to_string(),
+            workspace_key: None,
+            workspace_label: None,
+            agent: None,
+            content_preview: Some("request".to_string()),
+            tokens: tokens(input_tokens),
+            cost,
+            message_count: 1,
+            duration_ms: None,
+            request_start_timestamp: None,
+            request_end_timestamp: timestamp,
+            is_turn_start: true,
+        }
+    }
+
+    fn daily_usage(
+        date: &str,
+        models: Vec<(&str, &str, &str, f64, u64)>,
+        total_cost: f64,
+        total_tokens: u64,
+    ) -> DailyUsage {
+        let mut model_breakdown = BTreeMap::new();
+        for (model_key, provider, display_name, cost, input_tokens) in models {
+            model_breakdown.insert(
+                model_key.to_string(),
+                DailyModelInfo {
+                    provider: provider.to_string(),
+                    display_name: display_name.to_string(),
+                    color_key: display_name.to_string(),
+                    tokens: tokens(input_tokens),
+                    cost,
+                    messages: 1,
+                },
+            );
+        }
+
+        let mut source_breakdown = BTreeMap::new();
+        source_breakdown.insert(
+            "claude".to_string(),
+            DailySourceInfo {
+                tokens: tokens(total_tokens),
+                cost: total_cost,
+                models: model_breakdown,
+            },
+        );
+
+        DailyUsage {
+            date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+            tokens: tokens(total_tokens),
+            cost: total_cost,
+            source_breakdown,
+            message_count: 1,
+            turn_count: 1,
+        }
+    }
+
+    fn assert_totals(app: &App, tokens: u64, cost: f64) {
+        let totals = current_totals(app);
+        assert_eq!(totals.tokens, tokens);
+        assert!((totals.cost - cost).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -476,5 +670,84 @@ mod tests {
 
         app.remote_stats.as_mut().unwrap().device_count = 1;
         assert_eq!(data_source_label(&app), "local+remote (1 device)");
+    }
+
+    #[test]
+    fn test_current_totals_follow_model_drilldown() {
+        let data = UsageData {
+            models: vec![
+                model_usage("target-model", "target-model", 2.0, 200),
+                model_usage("other-model", "other-model", 1.0, 100),
+            ],
+            messages: vec![
+                message_usage("2026-05-18", "target-model", "session-a", 1_779_000_001_000, 50, 0.5),
+                message_usage("2026-05-18", "target-model", "session-a", 1_779_000_002_000, 50, 0.5),
+                message_usage("2026-05-18", "target-model", "session-b", 1_779_000_003_000, 100, 1.0),
+                message_usage("2026-05-18", "other-model", "session-c", 1_779_000_004_000, 100, 1.0),
+            ],
+            total_tokens: 300,
+            total_cost: 3.0,
+            ..Default::default()
+        };
+        let mut app = make_app_on_with_data(Tab::Models, data);
+
+        assert_totals(&app, 300, 3.0);
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_model_detail_active());
+        assert_totals(&app, 200, 2.0);
+        assert_eq!(current_count_label(&app), " (2 sessions)");
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_model_session_detail_active());
+        assert_totals(&app, 100, 1.0);
+        assert_eq!(current_count_label(&app), " (1 requests)");
+    }
+
+    #[test]
+    fn test_current_totals_follow_daily_drilldown() {
+        let data = UsageData {
+            daily: vec![
+                daily_usage(
+                    "2026-05-17",
+                    vec![("old-model", "anthropic", "old-model", 1.0, 100)],
+                    1.0,
+                    100,
+                ),
+                daily_usage(
+                    "2026-05-18",
+                    vec![
+                        ("a-target", "anthropic", "a-target", 2.0, 200),
+                        ("z-other", "anthropic", "z-other", 1.0, 100),
+                    ],
+                    3.0,
+                    300,
+                ),
+            ],
+            messages: vec![
+                message_usage("2026-05-18", "a-target", "session-a", 1_779_000_001_000, 50, 0.5),
+                message_usage("2026-05-18", "a-target", "session-b", 1_779_000_002_000, 150, 1.5),
+                message_usage("2026-05-18", "z-other", "session-c", 1_779_000_003_000, 100, 1.0),
+                message_usage("2026-05-17", "old-model", "session-old", 1_778_000_001_000, 100, 1.0),
+            ],
+            total_tokens: 400,
+            total_cost: 4.0,
+            ..Default::default()
+        };
+        let mut app = make_app_on_with_data(Tab::Daily, data);
+
+        assert_totals(&app, 400, 4.0);
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_daily_detail_active());
+        assert_totals(&app, 300, 3.0);
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_daily_model_detail_active());
+        assert_totals(&app, 200, 2.0);
+
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_daily_session_detail_active());
+        assert_totals(&app, 150, 1.5);
     }
 }
