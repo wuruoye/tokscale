@@ -899,20 +899,34 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     let mut micode_seen: HashSet<String> = HashSet::new();
 
     for db_path in &scan_result.micode_dbs {
+        // Pass `None` so the loader does not reprice: MiMo Code carries an
+        // authoritative per-message cost that unconditional repricing would
+        // overwrite (and persist to the cache). Reprice only messages that had
+        // no embedded cost, mirroring the gjc lane's guard.
         let CachedParseOutcome {
             messages,
             cache_entry,
             ..
-        } = load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
+        } = load_or_parse_sqlite_source(db_path, &source_cache, None, |path| {
             sessions::micode::parse_micode_sqlite(path)
         });
 
-        all_messages.extend(messages.into_iter().filter(|message| {
-            message
-                .dedup_key
-                .as_ref()
-                .is_none_or(|key| micode_seen.insert(key.clone()))
-        }));
+        all_messages.extend(
+            messages
+                .into_iter()
+                .map(|mut message| {
+                    if message.cost <= 0.0 {
+                        apply_pricing_if_available(&mut message, pricing);
+                    }
+                    message
+                })
+                .filter(|message| {
+                    message
+                        .dedup_key
+                        .as_ref()
+                        .is_none_or(|key| micode_seen.insert(key.clone()))
+                }),
+        );
 
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
@@ -1229,6 +1243,32 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             .filter(|message| should_keep_deduped_message(&mut gjc_seen, message)),
     );
 
+    // Junie events carry authoritative per-call `modelUsage.cost` values.
+    // Keep this off the generic source cache because cached_messages()
+    // reprices every message unconditionally; only fill cost from pricing
+    // when Junie emitted no usable cost.
+    let mut junie_seen: HashSet<String> = HashSet::new();
+    let junie_messages: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Junie)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::junie::parse_junie_file(path)
+                .into_iter()
+                .map(|mut msg| {
+                    if msg.cost <= 0.0 {
+                        apply_pricing_if_available(&mut msg, pricing);
+                    }
+                    msg
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    all_messages.extend(
+        junie_messages
+            .into_iter()
+            .filter(|message| should_keep_deduped_message(&mut junie_seen, message)),
+    );
+
     let kimi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Kimi)
         .par_iter()
@@ -1270,9 +1310,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::RooCode)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::roocode::parse_roocode_file(path)
-            })
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_roo_path,
+                sessions::roocode::parse_roocode_file,
+            )
         })
         .collect();
     for outcome in roocode_outcomes {
@@ -1286,9 +1330,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::KiloCode)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::kilocode::parse_kilocode_file(path)
-            })
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_roo_path,
+                sessions::kilocode::parse_kilocode_file,
+            )
         })
         .collect();
     for outcome in kilocode_outcomes {
@@ -1302,9 +1350,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Cline)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::cline::parse_cline_file(path)
-            })
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_roo_path,
+                sessions::cline::parse_cline_file,
+            )
         })
         .collect();
     for outcome in cline_outcomes {
@@ -2430,6 +2482,24 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let gjc_count = gjc_msgs.len() as i32;
     counts.set(ClientId::Gjc, gjc_count);
     messages.extend(gjc_msgs);
+
+    // ParsedMessage has no pricing service in scope, but Junie parser already
+    // preserves the embedded session costs for callers that need UnifiedMessage.
+    // Dedup still matters here because Junie can replay metadata events.
+    let junie_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Junie)
+        .par_iter()
+        .flat_map(|path| sessions::junie::parse_junie_file(path))
+        .collect();
+    let mut junie_seen: HashSet<String> = HashSet::new();
+    let junie_msgs: Vec<ParsedMessage> = junie_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut junie_seen, message))
+        .map(|message| unified_to_parsed(&message))
+        .collect();
+    let junie_count = summed_parsed_message_count(&junie_msgs);
+    counts.set(ClientId::Junie, junie_count);
+    messages.extend(junie_msgs);
 
     // Parse Kimi wire.jsonl files in parallel
     let kimi_msgs: Vec<ParsedMessage> = scan_result
@@ -3729,6 +3799,95 @@ mod tests {
         assert_eq!(messages[0].client, "cursor");
         assert_eq!(messages[0].model_id, "Composer 1.5");
         assert!(messages[0].cost > 0.0);
+    }
+
+    /// MiMo Code records carry an authoritative per-message cost. The micode
+    /// lane must NOT reprice a record that already has a cost, even when the
+    /// model has a market price that would compute a different (non-zero) value.
+    /// This must hold on the first parse AND on a subsequent cache hit, since
+    /// the previous bug repriced and persisted the inflated cost to the cache.
+    #[test]
+    #[serial_test::serial]
+    fn test_micode_authoritative_cost_is_not_repriced_on_first_parse_or_cache_hit() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            let micode_dir = source_home.path().join(".local/share/micode");
+            std::fs::create_dir_all(&micode_dir).unwrap();
+            let db_path = micode_dir.join("mimocode.db");
+
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            // Authoritative cost 0.05 with 1000 input / 500 output tokens.
+            let data_json = r#"{
+                "role": "assistant",
+                "modelID": "mimo-v2.5-pro",
+                "providerID": "mimo",
+                "cost": 0.05,
+                "tokens": { "input": 1000, "output": 500, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+                "time": { "created": 1700000000000.0 }
+            }"#;
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["msg_auth_cost", "ses_1", data_json],
+            )
+            .unwrap();
+            drop(conn);
+
+            // Pricing that WOULD reprice mimo-v2.5-pro to a different non-zero
+            // value (1000 * 0.001 + 500 * 0.002 = 2.0) if the guard were absent.
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "mimo-v2.5-pro".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    ..Default::default()
+                },
+            );
+            let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+            let first = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["micode".to_string()],
+                Some(&pricing),
+            );
+            assert_eq!(first.len(), 1);
+            assert!(
+                (first[0].cost - 0.05).abs() < 1e-9,
+                "authoritative cost must survive the first parse, got {}",
+                first[0].cost
+            );
+
+            // Second run hits the source cache; the persisted entry must still
+            // carry the authoritative cost rather than a repriced value.
+            let second = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["micode".to_string()],
+                Some(&pricing),
+            );
+            assert_eq!(second.len(), 1);
+            assert!(
+                (second[0].cost - 0.05).abs() < 1e-9,
+                "authoritative cost must survive the cache hit, got {}",
+                second[0].cost
+            );
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     fn write_kimi_repeated_status_fixture(source_home: &std::path::Path) {
@@ -6093,7 +6252,10 @@ mod tests {
         assert_eq!(parsed.messages.len(), 1);
         assert_eq!(parsed.messages[0].client, "opencode");
         assert_eq!(parsed.messages[0].model_id, "deepseek-v3-0324");
-        assert_eq!(parsed.messages[0].provider_id, "fireworks");
+        // opencode now canonicalizes the provider segment like every other
+        // session parser, so the raw "fireworks" gateway id resolves to its
+        // canonical "fireworks_ai" tag.
+        assert_eq!(parsed.messages[0].provider_id, "fireworks_ai");
     }
 
     #[test]
@@ -6123,7 +6285,8 @@ mod tests {
         );
         assert_eq!(messages[0].client, "opencode");
         assert_eq!(messages[0].model_id, "deepseek-v3-0324");
-        assert_eq!(messages[0].provider_id, "fireworks");
+        // Provider is canonicalized by the opencode parser (fireworks -> fireworks_ai).
+        assert_eq!(messages[0].provider_id, "fireworks_ai");
     }
 
     #[test]
@@ -6157,7 +6320,8 @@ mod tests {
         );
         assert_eq!(parsed.messages[0].client, "opencode");
         assert_eq!(parsed.messages[0].model_id, "deepseek-v3-0324");
-        assert_eq!(parsed.messages[0].provider_id, "fireworks");
+        // Provider is canonicalized by the opencode parser (fireworks -> fireworks_ai).
+        assert_eq!(parsed.messages[0].provider_id, "fireworks_ai");
     }
 
     #[test]
