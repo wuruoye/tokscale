@@ -39,10 +39,7 @@ pub fn parse_opencodereview_file(path: &Path) -> Vec<UnifiedMessage> {
 
         if record_type == "session_start" {
             if workspace.is_none() {
-                workspace = value
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
+                workspace = value.get("cwd").and_then(Value::as_str).map(str::to_string);
             }
             continue;
         }
@@ -183,7 +180,14 @@ mod tests {
         let content = format!(
             "{}\n{}\n",
             session_start("/home/user/project"),
-            llm_response("2026-01-15T10:00:05Z", "claude-sonnet-4-20250514", 1000, 200, 500, 100),
+            llm_response(
+                "2026-01-15T10:00:05Z",
+                "claude-sonnet-4-20250514",
+                1000,
+                200,
+                500,
+                100
+            ),
         );
         let msgs = parse_events(&content);
 
@@ -204,7 +208,14 @@ mod tests {
         let content = format!(
             "{}\n{}\n{}\n",
             session_start("/home/user/project"),
-            llm_response("2026-01-15T10:00:05Z", "claude-sonnet-4-20250514", 1000, 200, 0, 0),
+            llm_response(
+                "2026-01-15T10:00:05Z",
+                "claude-sonnet-4-20250514",
+                1000,
+                200,
+                0,
+                0
+            ),
             llm_response("2026-01-15T10:01:00Z", "gpt-4o", 500, 100, 0, 0),
         );
         let msgs = parse_events(&content);
@@ -213,7 +224,14 @@ mod tests {
 
     #[test]
     fn deduplicates_identical_records() {
-        let resp = llm_response("2026-01-15T10:00:05Z", "claude-sonnet-4-20250514", 1000, 200, 0, 0);
+        let resp = llm_response(
+            "2026-01-15T10:00:05Z",
+            "claude-sonnet-4-20250514",
+            1000,
+            200,
+            0,
+            0,
+        );
         let content = format!(
             "{}\n{}\n{}\n",
             session_start("/home/user/project"),
@@ -229,7 +247,14 @@ mod tests {
         let content = format!(
             "{}\n{}\n",
             session_start("/home/user/project"),
-            llm_response("2026-01-15T10:00:05Z", "claude-sonnet-4-20250514", 0, 0, 0, 0),
+            llm_response(
+                "2026-01-15T10:00:05Z",
+                "claude-sonnet-4-20250514",
+                0,
+                0,
+                0,
+                0
+            ),
         );
         let msgs = parse_events(&content);
         assert_eq!(msgs.len(), 0, "zero-token records should be skipped");
@@ -239,7 +264,14 @@ mod tests {
     fn works_without_session_start() {
         let content = format!(
             "{}\n",
-            llm_response("2026-01-15T10:00:05Z", "claude-sonnet-4-20250514", 1000, 200, 0, 0),
+            llm_response(
+                "2026-01-15T10:00:05Z",
+                "claude-sonnet-4-20250514",
+                1000,
+                200,
+                0,
+                0
+            ),
         );
         let msgs = parse_events(&content);
         assert_eq!(msgs.len(), 1);
