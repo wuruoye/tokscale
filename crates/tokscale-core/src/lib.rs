@@ -184,7 +184,13 @@ pub struct TokenBreakdown {
 
 impl TokenBreakdown {
     pub fn total(&self) -> i64 {
-        self.input + self.output + self.cache_read + self.cache_write + self.reasoning
+        // saturating so clamped (i64::MAX) buckets from a corrupt source can't
+        // overflow the sum.
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.reasoning)
     }
 }
 
@@ -1269,6 +1275,38 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             .filter(|message| should_keep_deduped_message(&mut junie_seen, message)),
     );
 
+    // ZCode v2 CLI stores authoritative model usage in SQLite.
+    if let Some(db_path) = &scan_result.zcode_db {
+        let CachedParseOutcome {
+            messages,
+            cache_entry,
+            ..
+        } = load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
+            sessions::zcode::parse_zcode_sqlite(path)
+        });
+        all_messages.extend(messages);
+        if let Some(entry) = cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
+    // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
+    // from the API response; otherwise estimated from content.
+    let zcode_messages: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::Zcode)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::zcode::parse_zcode_file(path)
+                .into_iter()
+                .map(|mut msg| {
+                    apply_pricing_if_available(&mut msg, pricing);
+                    msg
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    all_messages.extend(zcode_messages);
+
     let kimi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Kimi)
         .par_iter()
@@ -1703,11 +1741,13 @@ fn aggregate_model_usage_entries(
     let mut entries: Vec<ModelUsage> = model_map
         .into_values()
         .map(|mut entry| {
-            let total_tokens = entry.input.max(0)
-                + entry.output.max(0)
-                + entry.cache_read.max(0)
-                + entry.cache_write.max(0)
-                + entry.reasoning.max(0);
+            let total_tokens = entry
+                .input
+                .max(0)
+                .saturating_add(entry.output.max(0))
+                .saturating_add(entry.cache_read.max(0))
+                .saturating_add(entry.cache_write.max(0))
+                .saturating_add(entry.reasoning.max(0));
             entry.performance.finalize(total_tokens);
             let mut providers: Vec<&str> = entry.provider.split(", ").collect();
             providers.sort_unstable();
@@ -1730,11 +1770,14 @@ fn aggregate_model_usage_entries(
 }
 
 fn positive_token_total(tokens: &TokenBreakdown) -> i64 {
-    tokens.input.max(0)
-        + tokens.output.max(0)
-        + tokens.cache_read.max(0)
-        + tokens.cache_write.max(0)
-        + tokens.reasoning.max(0)
+    // saturating so multiple clamped (i64::MAX) buckets can't overflow the sum.
+    tokens
+        .input
+        .max(0)
+        .saturating_add(tokens.output.max(0))
+        .saturating_add(tokens.cache_read.max(0))
+        .saturating_add(tokens.cache_write.max(0))
+        .saturating_add(tokens.reasoning.max(0))
 }
 
 pub async fn get_model_report(options: ReportOptions) -> Result<ModelReport, String> {
@@ -2501,6 +2544,43 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Junie, junie_count);
     messages.extend(junie_msgs);
 
+    // ZCode v2 CLI SQLite usage plus legacy JSONL session transcripts.
+    let mut zcode_msgs: Vec<ParsedMessage> = scan_result
+        .zcode_db
+        .as_ref()
+        .map(|db_path| {
+            sessions::zcode::parse_zcode_sqlite(db_path)
+                .into_iter()
+                .map(|message| unified_to_parsed(&message))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    zcode_msgs.extend(
+        scan_result
+            .get(ClientId::Zcode)
+            .par_iter()
+            .flat_map(|path| sessions::zcode::parse_zcode_file(path))
+            .map(|message| unified_to_parsed(&message))
+            .collect::<Vec<_>>(),
+    );
+    let zcode_count = summed_parsed_message_count(&zcode_msgs);
+    counts.set(ClientId::Zcode, zcode_count);
+    messages.extend(zcode_msgs);
+
+    let opencodereview_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::OpenCodeReview)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::opencodereview::parse_opencodereview_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let opencodereview_count = summed_parsed_message_count(&opencodereview_msgs);
+    counts.set(ClientId::OpenCodeReview, opencodereview_count);
+    messages.extend(opencodereview_msgs);
+
     // Parse Kimi wire.jsonl files in parallel
     let kimi_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Kimi)
@@ -2922,6 +3002,21 @@ mod tests {
     use std::io::Write;
     use std::str::FromStr;
     use std::sync::Arc;
+
+    #[test]
+    fn token_total_saturates_on_overlarge_buckets() {
+        // Multiple clamped (i64::MAX) buckets from a corrupt source must
+        // saturate rather than overflow when summed.
+        let t = TokenBreakdown {
+            input: i64::MAX,
+            output: i64::MAX,
+            cache_read: i64::MAX,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        assert_eq!(t.total(), i64::MAX);
+        assert_eq!(super::positive_token_total(&t), i64::MAX);
+    }
 
     fn make_workspace_message(
         client: &str,
@@ -3815,7 +3910,7 @@ mod tests {
         std::env::set_var("HOME", cache_home.path());
 
         {
-            let micode_dir = source_home.path().join(".local/share/micode");
+            let micode_dir = source_home.path().join(".local/share/mimocode");
             std::fs::create_dir_all(&micode_dir).unwrap();
             let db_path = micode_dir.join("mimocode.db");
 

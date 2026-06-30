@@ -409,7 +409,10 @@ mod tests {
         .unwrap();
 
         let content = extract_session_content("claude", "sess", &[path]);
-        assert_eq!(content.first_user_message.as_deref(), Some("Add a CLI flag"));
+        assert_eq!(
+            content.first_user_message.as_deref(),
+            Some("Add a CLI flag")
+        );
         assert_eq!(content.client, "claude");
     }
 
@@ -430,8 +433,11 @@ mod tests {
     #[test]
     fn extract_session_content_unreadable_file_does_not_panic() {
         // Missing/unparseable candidate must degrade gracefully, never panic.
-        let content =
-            extract_session_content("codex", "sess", &[PathBuf::from("/definitely/missing.jsonl")]);
+        let content = extract_session_content(
+            "codex",
+            "sess",
+            &[PathBuf::from("/definitely/missing.jsonl")],
+        );
         assert!(content.first_user_message.is_none());
         assert_eq!(content.client, "codex");
     }
@@ -495,7 +501,10 @@ mod tests {
         .unwrap();
 
         let content = extract_gemini_content(&path, "b8d9ab56").unwrap();
-        assert_eq!(content.first_user_message.as_deref(), Some("Review the patch"));
+        assert_eq!(
+            content.first_user_message.as_deref(),
+            Some("Review the patch")
+        );
         assert_eq!(content.client, "gemini");
     }
 

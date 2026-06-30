@@ -29,6 +29,7 @@ pub mod micode;
 pub mod mux;
 pub mod openclaw;
 pub mod opencode;
+pub mod opencodereview;
 pub mod pi;
 pub mod qwen;
 pub mod roocode;
@@ -36,6 +37,7 @@ pub mod synthetic;
 pub mod trae;
 pub(crate) mod utils;
 pub mod warp;
+pub mod zcode;
 pub mod zed;
 
 use crate::TokenBreakdown;

@@ -463,7 +463,7 @@ define_clients!(
     MiMoCode = 30 => {
         id: "micode",
         root: PathRoot::XdgData,
-        relative: "micode",
+        relative: "mimocode",
         pattern: "*.db",
         headless: false,
         parse_local: true,
@@ -492,6 +492,24 @@ define_clients!(
         root: PathRoot::Home,
         relative: ".junie/sessions",
         pattern: "events.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    Zcode = 33 => {
+        id: "zcode",
+        root: PathRoot::Home,
+        relative: ".zcode/projects",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    OpenCodeReview = 34 => {
+        id: "opencodereview",
+        root: PathRoot::Home,
+        relative: ".opencodereview/sessions",
+        pattern: "*.jsonl",
         headless: false,
         parse_local: true,
         submit_default: true
@@ -547,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 33);
+        assert_eq!(ClientId::COUNT, 35);
     }
 
     #[test]

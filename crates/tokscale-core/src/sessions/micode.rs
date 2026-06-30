@@ -1,7 +1,7 @@
 //! MiMo Code session parser
 //!
 //! Parses messages from:
-//! - SQLite database: ~/.local/share/micode/mimocode.db
+//! - SQLite database: ~/.local/share/mimocode/mimocode.db
 
 use super::utils::open_readonly_sqlite;
 use super::{
@@ -803,7 +803,11 @@ mod tests {
         drop(conn);
 
         let messages = parse_micode_sqlite(&db_path);
-        assert_eq!(messages.len(), 1, "non-object path must not drop the message");
+        assert_eq!(
+            messages.len(),
+            1,
+            "non-object path must not drop the message"
+        );
         assert_eq!(messages[0].tokens.input, 100);
         // No usable root -> no workspace derived from the embedded path.
         assert_eq!(messages[0].workspace_key, None);

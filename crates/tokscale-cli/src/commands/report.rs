@@ -7,10 +7,10 @@ use std::process::{Command, Output, Stdio};
 use unicode_normalization::UnicodeNormalization;
 
 use super::apple_fm;
-use std::time::Duration;
 use std::path::PathBuf;
-use tokscale_core::content_extractor::{extract_session_content, metadata_only_content};
+use std::time::Duration;
 use tokscale_core::content_extractor::SessionContent;
+use tokscale_core::content_extractor::{extract_session_content, metadata_only_content};
 use tokscale_core::pricing::PricingService;
 use tokscale_core::wiki::{WikiDb, WikiEntry};
 use tokscale_core::{parse_local_clients, LocalParseOptions, ParsedMessage, TokenBreakdown};
@@ -1269,9 +1269,7 @@ fn build_session_path_index(opts: &ReportOptions) -> SessionPathIndex {
 
         if client == tokscale_core::ClientId::Gemini {
             // Gemini's wiki session_id comes from inside the file, not the stem.
-            if let Some(id) =
-                tokscale_core::sessions::gemini::gemini_session_id_for_file(&path)
-            {
+            if let Some(id) = tokscale_core::sessions::gemini::gemini_session_id_for_file(&path) {
                 session_ids.push(id);
             }
         }
@@ -1959,7 +1957,10 @@ mod tests {
 
         let mut by_client_session: HashMap<(String, String), Vec<PathBuf>> = HashMap::new();
         by_client_session.insert(
-            ("some-unsupported-client".to_string(), session_id.to_string()),
+            (
+                "some-unsupported-client".to_string(),
+                session_id.to_string(),
+            ),
             vec![path],
         );
         let index = SessionPathIndex {
@@ -1996,8 +1997,14 @@ mod tests {
         std::fs::write(&codex_path, "codex-bytes").unwrap();
 
         let mut by_client_session: HashMap<(String, String), Vec<PathBuf>> = HashMap::new();
-        by_client_session.insert(("claude".to_string(), "shared".to_string()), vec![claude_path.clone()]);
-        by_client_session.insert(("codex".to_string(), "shared".to_string()), vec![codex_path.clone()]);
+        by_client_session.insert(
+            ("claude".to_string(), "shared".to_string()),
+            vec![claude_path.clone()],
+        );
+        by_client_session.insert(
+            ("codex".to_string(), "shared".to_string()),
+            vec![codex_path.clone()],
+        );
         let index = SessionPathIndex {
             by_client_session,
             opencode_dbs: Vec::new(),

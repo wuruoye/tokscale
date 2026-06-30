@@ -414,8 +414,15 @@ fn collect_kiro_snapshot_text(
                 // Inline text body of a single message.
                 &["prompt", "response", "content", "text", "message"][..],
                 // Container holding a list of messages/turns.
-                &["messages", "conversation", "chat", "transcript", "entries", "events", "history"]
-                    [..],
+                &[
+                    "messages",
+                    "conversation",
+                    "chat",
+                    "transcript",
+                    "entries",
+                    "events",
+                    "history",
+                ][..],
                 // Sub-parts of a single message.
                 &["parts", "items", "nodes"][..],
             ] {
@@ -1042,10 +1049,7 @@ not valid json at all
             Some("claude-sonnet-4-5".to_string())
         );
 
-        let prompt_value: Value = serde_json::from_str(
-            r#"{"prompt": {"model": "auto"}}"#,
-        )
-        .unwrap();
+        let prompt_value: Value = serde_json::from_str(r#"{"prompt": {"model": "auto"}}"#).unwrap();
         assert_eq!(
             find_kiro_snapshot_model_id(&prompt_value),
             Some("auto".to_string())

@@ -139,8 +139,7 @@ pub fn gemini_session_id_for_file(path: &Path) -> Option<String> {
 
     // Chat recording: a single JSON document with a top-level `sessionId`.
     if let Ok(value) = serde_json::from_str::<Value>(&content) {
-        if let Some(id) =
-            extract_string(value.get("sessionId").or_else(|| value.get("session_id")))
+        if let Some(id) = extract_string(value.get("sessionId").or_else(|| value.get("session_id")))
         {
             return Some(id);
         }
